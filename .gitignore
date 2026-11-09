@@ -1,0 +1,121 @@
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# MCP config (contains secrets)
+.mcp.json
+
+# Superpowers brainstorm mockups
+.superpowers/
+
+# dependencies
+/node_modules
+/.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+
+# testing
+/coverage
+
+# next.js
+/.next/
+/out/
+
+# production
+/build
+
+# misc
+.DS_Store
+*.pem
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# env files (can opt-in for committing if needed)
+.env*
+!.env.example
+!**/.env.example
+
+# python (services/id-ocr OCR proxy)
+__pycache__/
+*.pyc
+
+# vercel
+.vercel
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
+
+# gemini
+.gemini
+.agent
+.claude
+
+.agents
+# credentials
+*-firebase-adminsdk-*.json
+
+# test scripts
+test-escrow.js
+test-query.js
+.claude/settings.local.json
+
+# supabase temp files
+supabase/.temp/
+
+# Worktrees
+.worktrees/
+
+# nested deps / builds (root entries above are anchored to repo root)
+**/node_modules/
+**/.next/
+
+# mobile — Android (build artifacts, machine SDK path, signing keys)
+mobile/android/.gradle/
+mobile/android/build/
+mobile/android/app/build/
+mobile/android/local.properties
+mobile/android/captures/
+*.keystore
+*.jks
+*.apk
+*.aab
+# ...but keep the debug APKs CI publishes here
+# (see .github/workflows/android-publish-apk.yml).
+# publishs/*.apk is no longer committed: release APKs embed API keys.
+# ...and keep the DEBUG keystore. It has to be committed: Google Sign-In is keyed to the
+# app's signing SHA-1, so a keystore generated per machine / per CI runner gives every
+# build a fingerprint that no OAuth client can be registered against. Debug credentials
+# only (android / androiddebugkey); the release keystore stays ignored.
+!mobile/android/app/debug.keystore
+
+# mobile — iOS / Xcode
+mobile/ios/build/
+# fastlane's gems install into the project (BUNDLE_PATH), not into the system
+# ruby, so `bundle install` works without touching /opt/homebrew.
+mobile/ios/.bundle/
+mobile/ios/vendor/bundle/
+mobile/ios/fastlane/report.xml
+mobile/ios/fastlane/Preview.html
+mobile/ios/fastlane/test_output/
+**/xcuserdata/
+*.xcuserstate
+*.ipa
+DerivedData/
+
+# local helper output
+local-backend/*.log
+
+
+
+# API keys / Firebase config — never commit
+GoogleService-Info.plist
+google-services.json
+publishs/
+.env

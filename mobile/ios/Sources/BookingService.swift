@@ -1,0 +1,1151 @@
+import Foundation
+
+/// Networking for reservations against the local Next.js API (no Supabase).
+///
+///   POST {base}/api/local/bookings  (Bearer qk_token) → 201 Booking | { error }
+///   GET  {base}/api/local/bookings  (Bearer qk_token) → [Booking]
+///
+/// The bearer token lives in `UserDefaults` under `AuthStore.tokenKey`
+/// ("qk_token"), written by `AuthStore` when the user signs in. We read it
+/// straight from there so the service stays decoupled from the store.
+struct BookingService {
+    static let shared = BookingService()
+
+    private let session: URLSession = {
+        let cfg = URLSessionConfiguration.default
+        cfg.timeoutIntervalForRequest = 15
+        cfg.waitsForConnectivity = true
+        return URLSession(configuration: cfg)
+    }()
+
+    /// The persisted bearer token, or `nil` when browsing as a guest.
+    var token: String? {
+        let value = UserDefaults.standard.string(forKey: AuthStore.tokenKey)
+        return (value?.isEmpty == false) ? value : nil
+    }
+
+    // MARK: - Create
+
+    /// Reserve a stay. Throws `BookingError.notSignedIn` when there is no token,
+    /// `BookingError.message` carrying the server's `{ error }` for 4xx
+    /// responses (e.g. "Those dates are not available").
+    @discardableResult
+    func reserve(listingID: String, checkIn: String, checkOut: String, guests: Int,
+                 adults: Int = 1, children: Int = 0, infants: Int = 0, pets: Int = 0) async throws -> Booking {
+        guard let token else { throw BookingError.notSignedIn }
+
+        let url = URL(string: "\(Config.apiBaseURL)/api/local/bookings")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.httpBody = try JSONSerialization.data(withJSONObject: [
+            "listing_id": listingID,
+            "check_in": checkIn,
+            "check_out": checkOut,
+            "guests": guests,
+            "adults": adults,
+            "children": children,
+            "infants": infants,
+            "pets": pets,
+        ])
+
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw BookingError.message("Invalid response from the server.")
+        }
+
+        if (200...299).contains(http.statusCode) {
+            return try JSONDecoder().decode(Booking.self, from: data)
+        }
+        if http.statusCode == 401 {
+            throw BookingError.notSignedIn
+        }
+        // 400 (and other 4xx/5xx): surface the server's { error } when present.
+        throw BookingError.message(Self.decodeError(data) ?? "Reservation failed (\(http.statusCode)).")
+    }
+
+    // MARK: - Pay (mock)
+
+    /// Pay for a booking via the backend's **mock** payment endpoint. Always
+    /// succeeds for the booking's owner — there's no real gateway yet. Returns
+    /// the server's `receipt` (amount breakdown + reference). The booking is
+    /// flipped to `payment_status: "paid"`, `status: "confirmed"` server-side.
+    ///
+    /// Throws `BookingError.notSignedIn` when there is no token (or the server
+    /// returns 401), and `BookingError.message` carrying the server's `{ error }`
+    /// for other non-2xx responses (e.g. 403 not your booking).
+    ///
+    /// `method` is `"card"` (adds a +5% surcharge) or `"bank_transfer"`
+    /// (applies a −5% discount). The returned receipt carries the signed
+    /// `methodFee` and the chosen `method`.
+    ///
+    /// `promoCode` (optional) is forwarded as `promo_code`; when valid the backend
+    /// nets the discount out of `total` and echoes `promoCode` / `promoDiscount`
+    /// on the receipt.
+    @discardableResult
+    func pay(bookingId: String, method: String, promoCode: String? = nil) async throws -> PaymentReceipt {
+        guard let token else { throw BookingError.notSignedIn }
+
+        let url = URL(string: "\(Config.apiBaseURL)/api/local/bookings/\(bookingId)/pay")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        // The backend prices the chosen method (card +5% / bank_transfer −5%) and
+        // applies any valid promo code.
+        var body: [String: Any] = ["method": method]
+        if let promo = promoCode?.trimmingCharacters(in: .whitespacesAndNewlines), !promo.isEmpty {
+            body["promo_code"] = promo
+        }
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw BookingError.message("Invalid response from the server.")
+        }
+
+        if (200...299).contains(http.statusCode) {
+            struct PayResponse: Decodable { let receipt: PaymentReceipt }
+            return try JSONDecoder().decode(PayResponse.self, from: data).receipt
+        }
+        if http.statusCode == 401 {
+            throw BookingError.notSignedIn
+        }
+        // 403 (not your booking) and other 4xx/5xx: surface the server's { error }.
+        throw BookingError.message(Self.decodeError(data) ?? "Payment failed (\(http.statusCode)).")
+    }
+
+    // MARK: - Instapay (manual bank transfer)
+
+    /// Load the Instapay transfer destination shown to the guest at checkout via
+    /// `GET /api/local/payment-config` (Bearer) → the handle, instructions, deep
+    /// link and QR. The guest sends the transfer to `handle` (or taps through the
+    /// link / scans the QR) and follows `instructions`, then uploads a screenshot
+    /// with `submitPaymentProof`. Throws
+    /// `BookingError.notSignedIn` (no token / 401).
+    func getPaymentConfig() async throws -> PaymentConfig {
+        guard let token else { throw BookingError.notSignedIn }
+
+        let url = URL(string: "\(Config.apiBaseURL)/api/local/payment-config")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw BookingError.message("Invalid response from the server.")
+        }
+        if http.statusCode == 401 { throw BookingError.notSignedIn }
+        guard (200...299).contains(http.statusCode) else {
+            throw BookingError.message(Self.decodeError(data) ?? "Couldn't load the transfer details (\(http.statusCode)).")
+        }
+        return try JSONDecoder().decode(PaymentConfig.self, from: data)
+    }
+
+    /// Upload the guest's transfer screenshot as proof of payment for
+    /// `bookingId` via `POST /api/local/bookings/:id/payment-proof`
+    /// `{ image, method }` (Bearer). `method` is the destination the guest picked,
+    /// which is how the reviewer knows which account to check. `imageDataURL` is a
+    /// `data:image/jpeg;base64,…` URL (produced by `QKAvatarImage.makeDataURL`).
+    /// The booking's `payment_status` flips to "submitted" — awaiting the host's
+    /// approval — and re-uploading is allowed (a host-rejected booking reopens).
+    ///
+    /// Throws `BookingError.notSignedIn` (no token / 401) or `BookingError.message`
+    /// carrying the server's `{ error }` for other non-2xx (e.g. 400 missing
+    /// screenshot, 403/404 when the booking isn't the caller's). The updated
+    /// `Booking` is returned best-effort; the caller only needs the 2xx to advance.
+    @discardableResult
+    func submitPaymentProof(
+        bookingId: String,
+        imageDataURL: String,
+        method: PaymentMethod = .instapay
+    ) async throws -> Booking? {
+        guard let token else { throw BookingError.notSignedIn }
+        // Flash is paid on its hosted page and confirmed by the server — a
+        // screenshot "for Flash" would only confuse the reviewer.
+        guard method.isManual else {
+            throw BookingError.message("Card and wallet payments don't need a screenshot.")
+        }
+
+        let encoded = bookingId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? bookingId
+        let url = URL(string: "\(Config.apiBaseURL)/api/local/bookings/\(encoded)/payment-proof")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.httpBody = try JSONSerialization.data(withJSONObject: [
+            "image": imageDataURL,
+            "method": method.rawValue,
+        ])
+
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw BookingError.message("Invalid response from the server.")
+        }
+        if (200...299).contains(http.statusCode) {
+            // The response is the updated booking (payment_status "submitted");
+            // decode it best-effort — a bare booking or a `{ booking }` wrapper.
+            if let booking = try? JSONDecoder().decode(Booking.self, from: data) { return booking }
+            struct Wrapped: Decodable { let booking: Booking }
+            return (try? JSONDecoder().decode(Wrapped.self, from: data))?.booking
+        }
+        if http.statusCode == 401 { throw BookingError.notSignedIn }
+        // 400 (missing screenshot) / 403 / 404 / other: surface the server's { error }.
+        throw BookingError.message(Self.decodeError(data) ?? "Couldn't submit your screenshot (\(http.statusCode)).")
+    }
+
+    // MARK: - Flash (card / wallet) checkout
+
+    /// Start (or resume) a Flash card / wallet checkout for `bookingId` via
+    /// `POST /api/local/bookings/:id/flash-checkout` (Bearer, empty body). Returns
+    /// the hosted `payment_link` to open; re-POSTing returns the same link while
+    /// it is valid, and mints a new one after a failed / canceled / expired try.
+    ///
+    /// Throws `BookingError.notSignedIn` (no token / 401) or `BookingError.message`
+    /// with the server's `{ error }` — 409 `flash_unavailable` / `not_payable`,
+    /// 400 `below_minimum`, 502 `flash_error`.
+    func flashCheckout(bookingId: String) async throws -> FlashCheckout {
+        try await flashCheckoutRequest(bookingId: bookingId, method: "POST")
+    }
+
+    /// The booking's current Flash checkout via
+    /// `GET /api/local/bookings/:id/flash-checkout` — refreshed from Flash
+    /// server-side, so this is what the sheet polls after the guest pays.
+    func flashCheckoutStatus(bookingId: String) async throws -> FlashCheckout {
+        try await flashCheckoutRequest(bookingId: bookingId, method: "GET")
+    }
+
+    private func flashCheckoutRequest(bookingId: String, method: String) async throws -> FlashCheckout {
+        guard let token else { throw BookingError.notSignedIn }
+
+        let encoded = bookingId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? bookingId
+        let url = URL(string: "\(Config.apiBaseURL)/api/local/bookings/\(encoded)/flash-checkout")!
+        var request = URLRequest(url: url)
+        request.httpMethod = method
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        if method == "POST" {
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = Data("{}".utf8)
+        }
+
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw BookingError.message("Invalid response from the server.")
+        }
+        if http.statusCode == 401 { throw BookingError.notSignedIn }
+        guard (200...299).contains(http.statusCode) else {
+            throw BookingError.message(Self.decodeError(data) ?? "Couldn't reach the card payment service (\(http.statusCode)).")
+        }
+        return try JSONDecoder().decode(FlashCheckout.self, from: data)
+    }
+
+    // MARK: - Promo codes
+
+    /// Preview a promo code against a subtotal via
+    /// `POST /api/local/promo/validate` `{ code, subtotal }` → `PromoQuote`.
+    /// Read-only: nothing is mutated. The returned quote's `valid` flag says
+    /// whether the code applies; `discount` is the EGP it would knock off.
+    ///
+    /// Does not require sign-in (the preview is public). Throws
+    /// `BookingError.message` carrying the server's `{ error }` for non-2xx.
+    func validatePromo(code: String, subtotal: Int) async throws -> PromoQuote {
+        let url = URL(string: "\(Config.apiBaseURL)/api/local/promo/validate")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        if let token { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
+        request.httpBody = try JSONSerialization.data(withJSONObject: [
+            "code": code.trimmingCharacters(in: .whitespacesAndNewlines),
+            "subtotal": subtotal,
+        ])
+
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw BookingError.message("Invalid response from the server.")
+        }
+        if (200...299).contains(http.statusCode) {
+            return try JSONDecoder().decode(PromoQuote.self, from: data)
+        }
+        // A 400/422 may still carry a `{ valid: false, message }` body — surface
+        // it as a quote so the UI can show the reason inline.
+        if let quote = try? JSONDecoder().decode(PromoQuote.self, from: data) {
+            return quote
+        }
+        throw BookingError.message(Self.decodeError(data) ?? "Couldn't check that code (\(http.statusCode)).")
+    }
+
+    // MARK: - Referrals
+
+    /// The signed-in user's referral summary via `GET /api/local/referrals`
+    /// (Bearer) → `ReferralSummary`. Throws `BookingError.notSignedIn` when there
+    /// is no token or the server returns 401.
+    func fetchReferrals() async throws -> ReferralSummary {
+        guard let token else { throw BookingError.notSignedIn }
+
+        let url = URL(string: "\(Config.apiBaseURL)/api/local/referrals")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw BookingError.message("Invalid response from the server.")
+        }
+        if http.statusCode == 401 { throw BookingError.notSignedIn }
+        guard (200...299).contains(http.statusCode) else {
+            throw BookingError.message(Self.decodeError(data) ?? "Couldn't load your referrals (\(http.statusCode)).")
+        }
+        return try JSONDecoder().decode(ReferralSummary.self, from: data)
+    }
+
+    // MARK: - Host notes
+
+    /// Attach (or update) the host's notes for a booking via
+    /// `PATCH /api/local/bookings/:id` with `{ "host_notes": notes }`. Host-only:
+    /// the backend returns 403 for anyone who isn't the listing's host. Returns
+    /// the updated `Booking` so the caller can refresh the displayed notes.
+    ///
+    /// Throws `BookingError.notSignedIn` (no token / 401) or
+    /// `BookingError.message` carrying the server's `{ error }` for other non-2xx.
+    @discardableResult
+    func setHostNotes(bookingId: String, notes: String) async throws -> Booking {
+        guard let token else { throw BookingError.notSignedIn }
+
+        let url = URL(string: "\(Config.apiBaseURL)/api/local/bookings/\(bookingId)")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "PATCH"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["host_notes": notes])
+
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw BookingError.message("Invalid response from the server.")
+        }
+        if (200...299).contains(http.statusCode) {
+            return try JSONDecoder().decode(Booking.self, from: data)
+        }
+        if http.statusCode == 401 { throw BookingError.notSignedIn }
+        // 403 (not the host) and other 4xx/5xx: surface the server's { error }.
+        throw BookingError.message(Self.decodeError(data) ?? "Couldn't save notes (\(http.statusCode)).")
+    }
+
+    // MARK: - Cancellation (guest)
+
+    /// Fetch the cancellation **quote** for a booking via
+    /// `GET /api/local/bookings/:id/cancel` (Bearer guest). Read-only: nothing is
+    /// mutated. Returns the policy, days-until-check-in, and the refund the guest
+    /// would receive — shown in the confirm sheet before they cancel.
+    ///
+    /// Throws `BookingError.notSignedIn` (no token / 401) or `BookingError.message`
+    /// carrying the server's `{ error }` for other non-2xx.
+    func cancellationQuote(bookingId: String) async throws -> CancellationQuote {
+        guard let token else { throw BookingError.notSignedIn }
+
+        let encoded = bookingId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? bookingId
+        let url = URL(string: "\(Config.apiBaseURL)/api/local/bookings/\(encoded)/cancel")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw BookingError.message("Invalid response from the server.")
+        }
+        if (200...299).contains(http.statusCode) {
+            return try JSONDecoder().decode(CancellationQuote.self, from: data)
+        }
+        if http.statusCode == 401 { throw BookingError.notSignedIn }
+        throw BookingError.message(Self.decodeError(data) ?? "Couldn't load the refund quote (\(http.statusCode)).")
+    }
+
+    /// Cancel a booking via `POST /api/local/bookings/:id/cancel` (Bearer guest).
+    /// The server flips `status` to `cancelled` and records the refund. Returns
+    /// the updated `Booking` (with `cancelled_at` / `refund_percent` set).
+    ///
+    /// Throws `BookingError.notSignedIn` (no token / 401) or `BookingError.message`
+    /// carrying the server's `{ error }` for other non-2xx (e.g. 400 not cancellable).
+    @discardableResult
+    func cancelReservation(bookingId: String) async throws -> Booking {
+        guard let token else { throw BookingError.notSignedIn }
+
+        let encoded = bookingId.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? bookingId
+        let url = URL(string: "\(Config.apiBaseURL)/api/local/bookings/\(encoded)/cancel")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw BookingError.message("Invalid response from the server.")
+        }
+        if (200...299).contains(http.statusCode) {
+            // Response is `{ booking, refund }`; we only need the updated booking.
+            struct CancelResponse: Decodable { let booking: Booking }
+            return try JSONDecoder().decode(CancelResponse.self, from: data).booking
+        }
+        if http.statusCode == 401 { throw BookingError.notSignedIn }
+        // 400 (not cancellable) and other 4xx/5xx: surface the server's { error }.
+        throw BookingError.message(Self.decodeError(data) ?? "Couldn't cancel this reservation (\(http.statusCode)).")
+    }
+
+    // MARK: - Cancellation policy (host)
+
+    /// Update a listing's cancellation policy via `PATCH /api/local/listings/:id`
+    /// with `{ cancellation_policy }` (Bearer host). Returns the updated `Listing`.
+    /// `policy` is `.flexible` / `.moderate` / `.strict`.
+    ///
+    /// Throws `BookingError.notSignedIn` (no token / 401) or `BookingError.message`
+    /// carrying the server's `{ error }` for other non-2xx (e.g. 403 not the host).
+    @discardableResult
+    func setCancellationPolicy(listingID: String, policy: CancellationPolicy) async throws -> Listing {
+        guard let token else { throw BookingError.notSignedIn }
+
+        let encoded = listingID.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? listingID
+        let url = URL(string: "\(Config.apiBaseURL)/api/local/listings/\(encoded)")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "PATCH"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["cancellation_policy": policy.rawValue])
+
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw BookingError.message("Invalid response from the server.")
+        }
+        if (200...299).contains(http.statusCode) {
+            return try JSONDecoder().decode(Listing.self, from: data)
+        }
+        if http.statusCode == 401 { throw BookingError.notSignedIn }
+        // 403 (not the host) and other 4xx/5xx: surface the server's { error }.
+        throw BookingError.message(Self.decodeError(data) ?? "Couldn't update the cancellation policy (\(http.statusCode)).")
+    }
+
+    // MARK: - Length-of-stay discounts (host)
+
+    /// Update a listing's length-of-stay discounts via
+    /// `PATCH /api/local/listings/:id` with `{ weekly_discount, monthly_discount }`
+    /// (Bearer host). Both are whole percentages (0–100); `0` clears a discount.
+    /// Returns the updated `Listing`.
+    ///
+    /// Throws `BookingError.notSignedIn` (no token / 401) or `BookingError.message`
+    /// carrying the server's `{ error }` for other non-2xx (e.g. 403 not the host).
+    @discardableResult
+    func setLengthOfStayDiscounts(listingID: String, weekly: Int, monthly: Int) async throws -> Listing {
+        guard let token else { throw BookingError.notSignedIn }
+
+        let encoded = listingID.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? listingID
+        let url = URL(string: "\(Config.apiBaseURL)/api/local/listings/\(encoded)")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "PATCH"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.httpBody = try JSONSerialization.data(withJSONObject: [
+            "weekly_discount": max(0, min(weekly, 100)),
+            "monthly_discount": max(0, min(monthly, 100)),
+        ])
+
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw BookingError.message("Invalid response from the server.")
+        }
+        if (200...299).contains(http.statusCode) {
+            return try JSONDecoder().decode(Listing.self, from: data)
+        }
+        if http.statusCode == 401 { throw BookingError.notSignedIn }
+        // 403 (not the host) and other 4xx/5xx: surface the server's { error }.
+        throw BookingError.message(Self.decodeError(data) ?? "Couldn't update the discounts (\(http.statusCode)).")
+    }
+
+    // MARK: - Seasonal pricing (host)
+
+    /// Update a listing's seasonal/variable pricing via
+    /// `PATCH /api/local/listings/:id` with
+    /// `{ weekend_price, weekend_days, monthly_prices }` (Bearer host).
+    /// `weekendPrice` is the nightly EGP rate, or `nil` to clear it;
+    /// `weekendDays` are the weekdays it is charged on (`0`=Sun … `6`=Sat);
+    /// `monthlyPrices` maps month "1".."12" → nightly EGP (only the months the
+    /// host set). Returns the updated `Listing`.
+    ///
+    /// The days are sent only alongside a real rate, because that is how the
+    /// server judges the pair: clearing the rate clears the days with it, and a
+    /// rate with no day lit is refused rather than quietly stored where no night
+    /// could ever be charged at it.
+    ///
+    /// Throws `BookingError.notSignedIn` (no token / 401) or `BookingError.message`
+    /// carrying the server's `{ error }` for other non-2xx (e.g. 403 not the host).
+    @discardableResult
+    func setSeasonalPricing(
+        listingID: String,
+        weekendPrice: Double?,
+        weekendDays: [Int],
+        monthlyPrices: [String: Double]
+    ) async throws -> Listing {
+        guard let token else { throw BookingError.notSignedIn }
+
+        let encoded = listingID.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? listingID
+        let url = URL(string: "\(Config.apiBaseURL)/api/local/listings/\(encoded)")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "PATCH"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        var body: [String: Any] = [
+            // Keep only positive per-month rates; an empty object clears them all.
+            "monthly_prices": monthlyPrices.filter { $0.value > 0 },
+        ]
+        if let weekendPrice, weekendPrice > 0 {
+            body["weekend_price"] = weekendPrice
+            body["weekend_days"] = WeekendSchedule.normalize(weekendDays)
+        } else {
+            body["weekend_price"] = NSNull()
+        }
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw BookingError.message("Invalid response from the server.")
+        }
+        if (200...299).contains(http.statusCode) {
+            return try JSONDecoder().decode(Listing.self, from: data)
+        }
+        if http.statusCode == 401 { throw BookingError.notSignedIn }
+        throw BookingError.message(Self.decodeError(data) ?? "Couldn't update the pricing (\(http.statusCode)).")
+    }
+
+    // MARK: - Stay quote (public)
+
+    /// Fetch the authoritative price quote for a stay via
+    /// `POST /api/local/listings/:id/quote` `{ checkIn, checkOut }`. Public — no
+    /// auth. The quote honors the weekend + per-month seasonal rates and the
+    /// length-of-stay discount, so the detail screen uses its `total` directly.
+    /// `checkIn`/`checkOut` are `yyyy-MM-dd`. Throws `BookingError.message` on a
+    /// non-2xx (the caller falls back to the naive client-side estimate).
+    func fetchStayQuote(listingID: String, checkIn: String, checkOut: String) async throws -> StayQuote {
+        let encoded = listingID.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? listingID
+        let url = URL(string: "\(Config.apiBaseURL)/api/local/listings/\(encoded)/quote")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.httpBody = try JSONSerialization.data(withJSONObject: [
+            "checkIn": checkIn,
+            "checkOut": checkOut,
+        ])
+
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw BookingError.message("Invalid response from the server.")
+        }
+        guard (200...299).contains(http.statusCode) else {
+            throw BookingError.message(Self.decodeError(data) ?? "Couldn't load the quote (\(http.statusCode)).")
+        }
+        return try JSONDecoder().decode(StayQuote.self, from: data)
+    }
+
+    // MARK: - Host calendar (per-date pricing + day-level availability)
+
+    /// A listing's day-by-day calendar via
+    /// `GET /api/local/listings/:id/calendar?start=&end=`, INCLUSIVE of both ends.
+    ///
+    /// The bearer token decides the money: the listing's host gets their RAW
+    /// nightly rates plus a `guestPrice` companion; everyone else gets only the
+    /// commission-inclusive figure. Sending the token when we have one is
+    /// therefore not optional — without it a host would see, and then edit, the
+    /// marked-up price as if it were their own.
+    ///
+    /// `start`/`end` are `yyyy-MM-dd`. Public (no auth required). `asGuest` drops
+    /// the token, for the reserve calendar: a host previewing their own listing
+    /// must see the prices a guest pays, not their raw rates.
+    func fetchCalendar(listingID: String, start: String, end: String, asGuest: Bool = false) async throws -> ListingCalendar {
+        let encoded = listingID.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? listingID
+        var components = URLComponents(string: "\(Config.apiBaseURL)/api/local/listings/\(encoded)/calendar")!
+        components.queryItems = [
+            URLQueryItem(name: "start", value: start),
+            URLQueryItem(name: "end", value: end),
+        ]
+        var request = URLRequest(url: components.url!)
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        if !asGuest, let token { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
+
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw BookingError.message("Invalid response from the server.")
+        }
+        guard (200...299).contains(http.statusCode) else {
+            throw BookingError.message(Self.decodeError(data) ?? "Couldn't load the calendar (\(http.statusCode)).")
+        }
+        return try JSONDecoder().decode(ListingCalendar.self, from: data)
+    }
+
+    /// Apply one edit to a set of days, via `PUT /api/local/listings/:id/calendar`.
+    ///
+    /// - `price: .set(n)` pins that nightly rate on every selected day.
+    /// - `price: .reset` DELETES those days' pinned rates so they fall back to
+    ///   the listing's weekend / month / base pricing. Not the same as setting
+    ///   the base price, which would stop tracking it the moment the host edited
+    ///   the listing.
+    /// - `price: .unchanged` leaves prices alone (use it to only block/unblock).
+    /// - `blocked: true/false` closes or opens the days; `nil` leaves
+    ///   availability alone.
+    ///
+    /// Days already held by a reservation come back in `skipped` rather than
+    /// failing the request — a host sweeping across a month will cross a booking
+    /// routinely, and refusing the whole edit would make the calendar unusable.
+    /// Host-only: 401 → `.notSignedIn`, 403 → `.message`.
+    @discardableResult
+    func updateCalendar(
+        listingID: String,
+        dates: [String],
+        price: CalendarPriceChange = .unchanged,
+        blocked: Bool? = nil,
+        note: String? = nil
+    ) async throws -> CalendarUpdateResult {
+        guard let token else { throw BookingError.notSignedIn }
+        guard !dates.isEmpty else { throw BookingError.message("Select at least one date.") }
+
+        let encoded = listingID.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? listingID
+        let url = URL(string: "\(Config.apiBaseURL)/api/local/listings/\(encoded)/calendar")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "PUT"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+
+        var body: [String: Any] = ["dates": dates]
+        // The API reads `price` with `in`, not truthiness: NSNull is "reset" and
+        // an absent key is "don't touch prices". Those are different edits.
+        switch price {
+        case .unchanged: break
+        case .reset: body["price"] = NSNull()
+        case .set(let amount): body["price"] = amount
+        }
+        if let blocked { body["blocked"] = blocked }
+        if let note = note?.trimmingCharacters(in: .whitespacesAndNewlines), !note.isEmpty {
+            body["note"] = note
+        }
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw BookingError.message("Invalid response from the server.")
+        }
+        if (200...299).contains(http.statusCode) {
+            return try JSONDecoder().decode(CalendarUpdateResult.self, from: data)
+        }
+        if http.statusCode == 401 { throw BookingError.notSignedIn }
+        throw BookingError.message(Self.decodeError(data) ?? "Couldn't save those dates (\(http.statusCode)).")
+    }
+
+    // MARK: - Availability (host)
+
+    /// Block a date range on a listing the signed-in user hosts, via
+    /// `POST /api/local/listings/:id/availability` with `{ start, end, note? }`.
+    /// `start`/`end` are `yyyy-MM-dd`; the span is half-open `[start, end)`.
+    /// Returns the created block. Host-only: 401 (no/invalid token) →
+    /// `.notSignedIn`, 403/400 → `.message` carrying the server's `{ error }`.
+    @discardableResult
+    func blockDates(listingID: String, start: String, end: String, note: String?) async throws -> AvailabilityRange {
+        guard let token else { throw BookingError.notSignedIn }
+
+        let encoded = listingID.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? listingID
+        let url = URL(string: "\(Config.apiBaseURL)/api/local/listings/\(encoded)/availability")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        var body: [String: Any] = ["start": start, "end": end]
+        if let note = note?.trimmingCharacters(in: .whitespacesAndNewlines), !note.isEmpty {
+            body["note"] = note
+        }
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw BookingError.message("Invalid response from the server.")
+        }
+        if (200...299).contains(http.statusCode) {
+            return try JSONDecoder().decode(AvailabilityRange.self, from: data)
+        }
+        if http.statusCode == 401 { throw BookingError.notSignedIn }
+        // 403 (not the host) / 400 (bad range): surface the server's { error }.
+        throw BookingError.message(Self.decodeError(data) ?? "Couldn't block those dates (\(http.statusCode)).")
+    }
+
+    /// Remove a host block via
+    /// `DELETE /api/local/listings/:id/availability?blockId=ID`. Host-only.
+    /// Throws `BookingError.notSignedIn` (no token / 401) or `BookingError.message`
+    /// carrying the server's `{ error }` for other non-2xx.
+    func unblockDates(listingID: String, blockID: String) async throws {
+        guard let token else { throw BookingError.notSignedIn }
+
+        let encoded = listingID.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? listingID
+        var components = URLComponents(string: "\(Config.apiBaseURL)/api/local/listings/\(encoded)/availability")!
+        components.queryItems = [URLQueryItem(name: "blockId", value: blockID)]
+        let url = components.url!
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "DELETE"
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw BookingError.message("Invalid response from the server.")
+        }
+        if (200...299).contains(http.statusCode) { return }
+        if http.statusCode == 401 { throw BookingError.notSignedIn }
+        throw BookingError.message(Self.decodeError(data) ?? "Couldn't remove the block (\(http.statusCode)).")
+    }
+
+    // MARK: - List
+
+    /// The signed-in user's reservations. Throws `BookingError.notSignedIn`
+    /// when there is no token or the server returns 401.
+    func fetchReservations() async throws -> [Booking] {
+        guard let token else { throw BookingError.notSignedIn }
+
+        let url = URL(string: "\(Config.apiBaseURL)/api/local/bookings")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw BookingError.message("Invalid response from the server.")
+        }
+        if http.statusCode == 401 { throw BookingError.notSignedIn }
+        guard (200...299).contains(http.statusCode) else {
+            throw BookingError.message(Self.decodeError(data) ?? "Failed to load reservations (\(http.statusCode)).")
+        }
+        return try JSONDecoder().decode([Booking].self, from: data)
+    }
+
+    // MARK: - Helpers
+
+    private static func decodeError(_ data: Data) -> String? {
+        struct ErrorBody: Decodable { let error: String }
+        return (try? JSONDecoder().decode(ErrorBody.self, from: data))?.error
+    }
+}
+
+/// Errors surfaced to the reserve / reservations UI.
+enum BookingError: LocalizedError {
+    case notSignedIn
+    case message(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .notSignedIn: return "Sign in to reserve"
+        case let .message(text): return text
+        }
+    }
+}
+
+/// The ways a guest can pay. Mirrors the server's `PAYMENT_METHODS`. For the two
+/// manual methods the raw value is what goes back as `method` on the payment
+/// proof; `flash` is automatic (hosted card / wallet checkout) and never sends a
+/// proof.
+enum PaymentMethod: String, Decodable, Hashable, CaseIterable {
+    case instapay
+    case bankTransfer = "bank_transfer"
+    case flash
+
+    /// Localization key for the picker label.
+    var titleKey: String {
+        switch self {
+        case .instapay: return "payMethods.instapay"
+        case .bankTransfer: return "payMethods.bankTransfer"
+        case .flash: return "payMethods.flash"
+        }
+    }
+
+    /// True for the transfer-then-upload-a-screenshot methods. Only these may be
+    /// sent as a payment proof's `method`.
+    var isManual: Bool { self != .flash }
+}
+
+/// The automatic Flash method's switches from `payment-config`. `configured`
+/// means the server holds Flash credentials; `enabled` is the admin toggle. The
+/// server already folds both into `available_methods`, so these are informational.
+struct FlashPaymentConfig: Decodable, Hashable {
+    let enabled: Bool
+    let configured: Bool
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        enabled = (try c.decodeIfPresent(Bool.self, forKey: .enabled)) ?? false
+        configured = (try c.decodeIfPresent(Bool.self, forKey: .configured)) ?? false
+    }
+
+    enum CodingKeys: String, CodingKey { case enabled, configured }
+
+    /// What a pre-Flash API response decodes to.
+    static let off = FlashPaymentConfig()
+    private init() { enabled = false; configured = false }
+}
+
+/// A booking's Flash checkout, from `POST` / `GET
+/// /api/local/bookings/:id/flash-checkout`. `paid` is the server's verdict on the
+/// booking; `status` is Flash's view of the latest attempt (see
+/// `FlashCheckoutRules`). `paymentLink` is the hosted page to open; re-POSTing
+/// returns the same link while it is still valid.
+struct FlashCheckout: Codable, Hashable {
+    /// pending | processing | succeeded | failed | canceled | refunded | expired | none
+    let status: String
+    let paid: Bool
+    let paymentLink: String?
+    /// ISO-8601 time the link stops working.
+    let expiresAt: String?
+    /// The amount Flash charges, in piastres.
+    let amountCents: Int?
+    let orderId: String?
+
+    enum CodingKeys: String, CodingKey {
+        case status, paid
+        case paymentLink = "payment_link"
+        case expiresAt = "expires_at"
+        case amountCents = "amount_cents"
+        case orderId = "order_id"
+    }
+
+    /// Lenient: every key is optional, and `order_id` may arrive as a number.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        status = (try? c.decodeIfPresent(String.self, forKey: .status)) ?? "none"
+        paid = (try? c.decodeIfPresent(Bool.self, forKey: .paid)) ?? false
+        paymentLink = try? c.decodeIfPresent(String.self, forKey: .paymentLink)
+        expiresAt = try? c.decodeIfPresent(String.self, forKey: .expiresAt)
+        if let cents = try? c.decodeIfPresent(Int.self, forKey: .amountCents) {
+            amountCents = cents
+        } else {
+            amountCents = (try? c.decodeIfPresent(Double.self, forKey: .amountCents)).map { Int($0.rounded()) }
+        }
+        if let id = try? c.decodeIfPresent(String.self, forKey: .orderId) {
+            orderId = id
+        } else {
+            orderId = (try? c.decodeIfPresent(Int.self, forKey: .orderId)).map(String.init)
+        }
+    }
+
+    /// The hosted page as an https URL, or `nil`.
+    var checkoutURL: URL? { FlashCheckoutRules.checkoutURL(paymentLink) }
+    var stage: FlashCheckoutRules.Stage { FlashCheckoutRules.stage(status: status, paid: paid) }
+}
+
+/// The bank account half of the destination — an ordinary transfer, offered
+/// alongside Instapay. All four values are admin-set in web `/ops/payments`.
+///
+/// The account number and IBAN are carried and shown WHOLE, never masked: they
+/// exist to be typed into a banking app.
+struct BankTransferConfig: Decodable, Hashable {
+    let bankName: String
+    /// The beneficiary. Egyptian banking apps check it against the account.
+    let accountName: String
+    let accountNumber: String
+    /// Optional — the account number plus the bank is enough for a domestic transfer.
+    let iban: String
+    /// `iban` in groups of four, as the server formats it, for display only.
+    let ibanFormatted: String
+    let instructions: String
+
+    enum CodingKeys: String, CodingKey {
+        case bankName = "bank_name"
+        case accountName = "account_name"
+        case accountNumber = "account_number"
+        case iban
+        case ibanFormatted = "iban_formatted"
+        case instructions
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        bankName = (try c.decodeIfPresent(String.self, forKey: .bankName)) ?? ""
+        accountName = (try c.decodeIfPresent(String.self, forKey: .accountName)) ?? ""
+        accountNumber = (try c.decodeIfPresent(String.self, forKey: .accountNumber)) ?? ""
+        iban = (try c.decodeIfPresent(String.self, forKey: .iban)) ?? ""
+        let formatted = (try c.decodeIfPresent(String.self, forKey: .ibanFormatted)) ?? ""
+        ibanFormatted = formatted.isEmpty ? iban : formatted
+        instructions = (try c.decodeIfPresent(String.self, forKey: .instructions)) ?? ""
+    }
+
+    /// The empty destination a pre-bank API response decodes to.
+    static let empty = BankTransferConfig()
+
+    private init() {
+        bankName = ""; accountName = ""; accountNumber = ""
+        iban = ""; ibanFormatted = ""; instructions = ""
+    }
+}
+
+/// Every transfer destination shown to the guest at checkout, from
+/// `GET /api/local/payment-config`: the Instapay handle/QR/link and the bank
+/// account, each with its own admin toggle, plus the derived `availableMethods`.
+/// All of it is admin-editable in web `/ops/payments`; any field may be blank.
+struct PaymentConfig: Decodable, Hashable {
+    /// The Instapay handle/address the guest transfers to (may be empty if unset).
+    let handle: String
+    /// Free-text transfer instructions to show alongside the handle (may be empty).
+    let instructions: String
+    /// Deep link that opens Instapay on the account, e.g. `https://ipn.eg/S/…`.
+    let link: String
+    /// The admin's uploaded QR as a base64 data URL. Empty ⇒ draw one from `qrPayload`.
+    let qrImage: String
+    /// What to encode when we draw the QR ourselves: the link if set, else the handle.
+    let qrPayload: String
+    let bank: BankTransferConfig
+    /// The automatic card / wallet method's switches (`.off` from an older server).
+    let flash: FlashPaymentConfig
+    /// Which methods to offer, in order. **The server's decision** — it already
+    /// accounts for both the toggles and whether each destination is complete, so
+    /// this list is rendered as-is rather than being re-derived here. That is what
+    /// keeps an admin's toggle meaningful on a build that shipped months ago.
+    let availableMethods: [PaymentMethod]
+
+    enum CodingKeys: String, CodingKey {
+        case handle = "instapay_handle"
+        case instructions
+        case link = "instapay_link"
+        case qrImage = "instapay_qr_image"
+        case qrPayload = "qr_payload"
+        case instapayEnabled = "instapay_enabled"
+        case bank
+        case flash
+        case availableMethods = "available_methods"
+    }
+
+    /// Every field is optional so a build running against an API that predates the
+    /// QR/link/bank keys still decodes — a missing key reads as empty rather than
+    /// failing the whole response. `qrPayload` and `availableMethods` are derived
+    /// the same way the server derives them when the response omits them, which is
+    /// what lets this app talk to an older deployment.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        handle = (try c.decodeIfPresent(String.self, forKey: .handle)) ?? ""
+        instructions = (try c.decodeIfPresent(String.self, forKey: .instructions)) ?? ""
+        link = (try c.decodeIfPresent(String.self, forKey: .link)) ?? ""
+        qrImage = (try c.decodeIfPresent(String.self, forKey: .qrImage)) ?? ""
+        let payload = (try c.decodeIfPresent(String.self, forKey: .qrPayload)) ?? ""
+        qrPayload = payload.isEmpty ? (link.isEmpty ? handle : link) : payload
+        bank = (try c.decodeIfPresent(BankTransferConfig.self, forKey: .bank)) ?? .empty
+        flash = (try? c.decodeIfPresent(FlashPaymentConfig.self, forKey: .flash)) ?? .off
+
+        // An unknown method from a newer server is dropped rather than failing the
+        // decode: this app can't render a destination it has no UI for, but it can
+        // still offer the ones it knows.
+        let raw = (try c.decodeIfPresent([String].self, forKey: .availableMethods))
+        if let raw {
+            availableMethods = raw.compactMap(PaymentMethod.init(rawValue:))
+        } else {
+            // Pre-`available_methods` server: Instapay was the only method, and it
+            // was offered whenever it had a destination.
+            let hasInstapay = !handle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                || !link.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            let enabled = (try c.decodeIfPresent(Bool.self, forKey: .instapayEnabled)) ?? true
+            availableMethods = (hasInstapay && enabled) ? [.instapay] : []
+        }
+    }
+
+    /// False until an admin has set up at least one way to pay — the UI blocks
+    /// payment when there is nowhere to send money.
+    var isConfigured: Bool { !availableMethods.isEmpty }
+
+    /// The deep link as a URL, when it is a well-formed web link. http(s) only —
+    /// the server validates the same way, so anything else is treated as unset.
+    var linkURL: URL? {
+        let s = link.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard s.hasPrefix("http://") || s.hasPrefix("https://") else { return nil }
+        return URL(string: s)
+    }
+}
+
+/// The receipt returned by the mock pay endpoint
+/// (`POST /api/local/bookings/:id/pay` → `{ receipt: {…} }`). All amounts are
+/// in EGP. `reference` is the "QK-…" confirmation code; `paidAt` is ISO-8601.
+struct PaymentReceipt: Codable, Hashable {
+    let currency: String
+    let nights: Int
+    let nightly: Int
+    let subtotal: Int
+    let serviceFee: Int
+    /// Signed payment-method adjustment in EGP: positive for the card surcharge
+    /// (+5% of subtotal), negative for the bank-transfer discount (−5%).
+    let methodFee: Int
+    let total: Int
+    let reference: String
+    let paidAt: String
+    /// The chosen method, "card" or "bank_transfer".
+    let method: String
+    /// The promo code applied at checkout, echoed by the backend. `nil` when the
+    /// guest didn't apply one.
+    let promoCode: String?
+    /// The discount the applied promo code knocked off the total, in EGP.
+    /// `nil`/`0` when no promo was applied. `total` already nets this out.
+    let promoDiscount: Int?
+    // Property names match the backend's JSON keys exactly (currency, nights,
+    // nightly, subtotal, serviceFee, methodFee, total, reference, paidAt, method,
+    // promoCode, promoDiscount), so the synthesized Codable keys are correct.
+
+    /// `true` when a promo code was applied and knocked at least 1 EGP off.
+    var hasPromo: Bool {
+        let trimmed = promoCode?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return (trimmed?.isEmpty == false) && (promoDiscount ?? 0) > 0
+    }
+}
+
+/// The preview returned by `POST /api/local/promo/validate` `{ code, subtotal }`
+/// → `{ valid, code, kind, value, discount, message }`. No mutation happens; the
+/// guest sees the discount before applying it at pay time. `discount` is in EGP.
+struct PromoQuote: Decodable, Hashable {
+    /// Whether the code is valid for this subtotal.
+    let valid: Bool
+    /// The normalized promo code (echoed back, may be upper-cased by the server).
+    let code: String?
+    /// "percent" | "fixed" — how `value` should be read. Optional; the UI relies
+    /// on `discount` for the actual amount.
+    let kind: String?
+    /// The raw discount value (a percentage when `kind == "percent"`, otherwise a
+    /// flat EGP amount). Optional.
+    let value: Double?
+    /// The computed discount for the supplied subtotal, in EGP.
+    let discount: Int
+    /// A human message from the server (e.g. "Code expired" / "10% off applied").
+    let message: String?
+
+    enum CodingKeys: String, CodingKey {
+        case valid, code, kind, value, discount, message
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        valid = try c.decodeIfPresent(Bool.self, forKey: .valid) ?? false
+        code = try c.decodeIfPresent(String.self, forKey: .code)
+        kind = try c.decodeIfPresent(String.self, forKey: .kind)
+        value = try c.decodeIfPresent(Double.self, forKey: .value)
+        // Tolerate a Double discount from the server; round to whole EGP.
+        if let intDiscount = try? c.decodeIfPresent(Int.self, forKey: .discount) {
+            discount = intDiscount ?? 0
+        } else {
+            discount = Int((try c.decodeIfPresent(Double.self, forKey: .discount) ?? 0).rounded())
+        }
+        message = try c.decodeIfPresent(String.self, forKey: .message)
+    }
+
+    /// "−EGP 110" style discount line.
+    var discountText: String { "−EGP \(discount)" }
+}
+
+/// The referral summary returned by `GET /api/local/referrals` (Bearer) →
+/// `{ code, count, rewardTotal, referred:[{ name, created_at, reward_amount }] }`.
+/// Drives the "Refer friends" surface (the user's code + stats + invitee list).
+struct ReferralSummary: Decodable, Hashable {
+    /// The signed-in user's shareable referral code.
+    let code: String
+    /// How many friends have signed up with this code.
+    let count: Int
+    /// The total reward earned so far, in EGP.
+    let rewardTotal: Int
+    /// The people who signed up via this code (most-recent first, server order).
+    let referred: [ReferredFriend]
+
+    enum CodingKeys: String, CodingKey {
+        case code, count, rewardTotal, referred
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        code = (try c.decodeIfPresent(String.self, forKey: .code)) ?? ""
+        count = try c.decodeIfPresent(Int.self, forKey: .count) ?? 0
+        if let intTotal = try? c.decodeIfPresent(Int.self, forKey: .rewardTotal) {
+            rewardTotal = intTotal ?? 0
+        } else {
+            rewardTotal = Int((try c.decodeIfPresent(Double.self, forKey: .rewardTotal) ?? 0).rounded())
+        }
+        referred = try c.decodeIfPresent([ReferredFriend].self, forKey: .referred) ?? []
+    }
+
+    /// "EGP 250" style total reward.
+    var rewardTotalText: String { "EGP \(rewardTotal)" }
+}
+
+/// One friend who signed up via the user's referral code, inside `ReferralSummary`.
+struct ReferredFriend: Decodable, Hashable, Identifiable {
+    /// Display name of the invited friend (may be blank → "A friend").
+    let name: String?
+    /// ISO-8601 timestamp they joined, from `created_at`. `nil` when absent.
+    let createdAt: String?
+    /// The reward this referral earned, in EGP, from `reward_amount`.
+    let rewardAmount: Int
+
+    enum CodingKeys: String, CodingKey {
+        case name
+        case createdAt = "created_at"
+        case rewardAmount = "reward_amount"
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        name = try c.decodeIfPresent(String.self, forKey: .name)
+        createdAt = try c.decodeIfPresent(String.self, forKey: .createdAt)
+        if let intReward = try? c.decodeIfPresent(Int.self, forKey: .rewardAmount) {
+            rewardAmount = intReward ?? 0
+        } else {
+            rewardAmount = Int((try c.decodeIfPresent(Double.self, forKey: .rewardAmount) ?? 0).rounded())
+        }
+    }
+
+    /// `Identifiable` by name + timestamp (stable enough for the list).
+    var id: String { "\(name ?? "friend")-\(createdAt ?? UUID().uuidString)" }
+
+    /// Display name, falling back to a generic "A friend".
+    @MainActor
+    var displayName: String {
+        let trimmed = name?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return (trimmed?.isEmpty == false) ? trimmed! : L.t("referral.aFriend")
+    }
+
+    /// "EGP 50" style reward, or "—" when zero.
+    var rewardText: String { rewardAmount > 0 ? "EGP \(rewardAmount)" : "—" }
+
+    /// "Jul 2026" style month label parsed from `created_at` (empty if absent).
+    var monthText: String {
+        guard let createdAt, let date = ReferredFriend.parseDate(createdAt) else { return "" }
+        return ReferredFriend.monthFormatter.string(from: date)
+    }
+
+    private static func parseDate(_ raw: String) -> Date? {
+        let withFraction = ISO8601DateFormatter()
+        withFraction.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let d = withFraction.date(from: raw) { return d }
+        let plain = ISO8601DateFormatter()
+        plain.formatOptions = [.withInternetDateTime]
+        if let d = plain.date(from: raw) { return d }
+        let dateOnly = DateFormatter()
+        dateOnly.locale = Locale(identifier: "en_US_POSIX")
+        dateOnly.dateFormat = "yyyy-MM-dd"
+        return dateOnly.date(from: raw)
+    }
+
+    private static let monthFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = .current
+        f.dateFormat = "MMM yyyy"
+        return f
+    }()
+}

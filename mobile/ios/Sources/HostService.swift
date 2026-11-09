@@ -1,0 +1,1099 @@
+import Foundation
+
+/// Networking for the host area + reservation detail, against the local Next.js
+/// API (no Supabase). Mirrors `BookingService`: pure URLSession + Codable, and
+/// reads the bearer token straight from `UserDefaults` under
+/// `AuthStore.tokenKey` ("qk_token") so it stays decoupled from the auth store.
+///
+///   POST  {base}/api/local/listings        → 201 Listing  (403 if role != host)
+///   PATCH {base}/api/local/listings/:id     → Listing (host edits any field → back to review)
+///   POST  {base}/api/local/listings/:id/images           → Listing (append photos)
+///   PATCH {base}/api/local/listings/:id/images           → Listing ({ order: [imageId] })
+///   DELETE {base}/api/local/listings/:id/images/:imageId → Listing (remove one photo)
+///   GET   {base}/api/local/host/bookings    → [HostBooking]
+///   GET   {base}/api/local/host/listings    → [Listing]
+///   POST  {base}/api/local/host/apply        → { host_status } (become-a-host application)
+///   GET   {base}/api/local/host/application  → HostApplicationState
+///   PATCH {base}/api/local/bookings/:id      → updated booking  (confirm | reject)
+///   GET   {base}/api/local/bookings/:id      → ReservationDetail
+///   GET   {base}/api/local/bookings/:id/stay-guide           → [StayGuideItem] (host or guest)
+///   POST  {base}/api/local/bookings/:id/stay-guide           → 201 StayGuideItem (host, confirmed only)
+///   PATCH {base}/api/local/bookings/:id/stay-guide/:itemId   → StayGuideItem   (host only)
+///   DELETE {base}/api/local/bookings/:id/stay-guide/:itemId  → 204             (host only)
+struct HostService {
+    static let shared = HostService()
+
+    private let session: URLSession = {
+        let cfg = URLSessionConfiguration.default
+        // Create, the photo appends and the ownership-doc PATCH all carry base64
+        // images — megabytes of them, from a phone on 4G. This is the idle
+        // timeout, so it only fires when the upload has actually stalled; at 20s
+        // a host on a weak signal was told the create failed while it was still
+        // going out, and tapping Submit again is how a listing gets made twice.
+        cfg.timeoutIntervalForRequest = 60
+        cfg.waitsForConnectivity = true
+        return URLSession(configuration: cfg)
+    }()
+
+    /// The persisted bearer token, or `nil` when browsing as a guest.
+    var token: String? {
+        let value = UserDefaults.standard.string(forKey: AuthStore.tokenKey)
+        return (value?.isEmpty == false) ? value : nil
+    }
+
+    /// Photos a single listing may carry. Enforced by the add-listing wizard and
+    /// the host editor alike, and matched by the backend's `MAX_LISTING_PHOTOS`.
+    static let maxListingPhotos = 10
+
+    // MARK: - Create listing (host only)
+
+    /// Fields the "Add listing" form collects. Sent as the POST body.
+    struct NewListing {
+        var title: String
+        var description: String
+        var location: String
+        var country: String
+        /// Curated area the host picked (e.g. "North Coast"). Sent as `region`;
+        /// omitted from the body when nil.
+        var region: String?
+        /// The catalog resort the host picked, sent as `resort_id`. Wins over
+        /// `resortName` server-side, and its region overrides `region` — that is
+        /// the point of a resort belonging to one.
+        var resortId: String? = nil
+        /// A resort / compound name the host TYPED because the catalog has not
+        /// got theirs, sent as `resort_name`. The listing publishes with the text
+        /// as written and the name queues for an admin to approve or merge.
+        var resortName: String? = nil
+        var pricePerNight: Double
+        var bedrooms: Int
+        var beds: Int
+        var bathrooms: Int
+        var maxGuests: Int
+        var propertyType: String
+        /// Device photos the host picked, each a `data:image/*;base64,…` data URL
+        /// (or an `http(s)` URL), in display order. The first is the listing
+        /// cover. Sent as `images: [String]`; empty when the host added none.
+        var images: [String] = []
+        /// Amenity labels the host selected (e.g. "WiFi", "Pool"). Sent as
+        /// `amenities: [String]`; empty when none chosen.
+        var amenities: [String] = []
+        /// The host-chosen cancellation policy. Sent as `cancellation_policy`;
+        /// defaults to `.moderate`.
+        var cancellationPolicy: CancellationPolicy = .moderate
+        /// Length-of-stay weekly discount (% off ≥7-night stays). Sent as
+        /// `weekly_discount`; `0` means no discount.
+        var weeklyDiscount: Int = 0
+        /// Length-of-stay monthly discount (% off ≥28-night stays). Sent as
+        /// `monthly_discount`; `0` means no discount.
+        var monthlyDiscount: Int = 0
+        /// Optional seasonal weekend nightly rate (EGP). Sent as `weekend_price`;
+        /// `nil` (or ≤0) means no weekend rate.
+        var weekendPrice: Double? = nil
+        /// Which weekdays that rate is charged on (`0`=Sun … `6`=Sat), sent as
+        /// `weekend_days`. Pre-filled with the default weekend, so a host who
+        /// never opens the picker gets exactly what the screen promised them.
+        var weekendDays: [Int] = WeekendSchedule.defaultDays
+        /// Optional per-month seasonal nightly rates (EGP), keyed by month
+        /// "1".."12". Sent as `monthly_prices`; only the months the host filled
+        /// in are included (empty when none set).
+        var monthlyPrices: [String: Double] = [:]
+        /// The ownership / proof-of-ownership document the host uploaded, as a
+        /// `data:image/*;base64,…` or `data:application/pdf;base64,…` URL — see
+        /// `OwnershipDocPicker`, which encodes both and enforces the size cap.
+        /// Sent as `ownership_doc`; omitted from the body when empty. New
+        /// listings are created pending + unpublished until an admin approves.
+        var ownershipDoc: String = ""
+        /// Map coordinate chosen via the host pin-picker (optional).
+        var lat: Double?
+        var lng: Double?
+    }
+
+    /// What one create attempt actually landed.
+    ///
+    /// A listing's photos do not all fit in one request — see `ListingPhotoUpload`
+    /// for why — so a create is a POST followed by the appends its photos need.
+    /// The POST either creates the listing or throws; a later append that fails
+    /// must NOT throw, because by then the listing exists, and a host told
+    /// "Couldn't create the listing" taps Submit again and ends up with two.
+    struct CreateOutcome {
+        /// The listing as the server last echoed it.
+        let listing: Listing
+        /// Photos that never landed, because an append request failed. The host
+        /// adds them from "Edit listing"; the listing itself is fine.
+        let photosMissing: Int
+        /// True when the ownership document had to travel in its own PATCH and
+        /// that PATCH failed. The dashboard offers to re-submit it.
+        let documentMissing: Bool
+
+        /// Everything the host filled in reached the server.
+        var isComplete: Bool { photosMissing == 0 && !documentMissing }
+    }
+
+    /// Create a listing. Throws `HostError.forbidden` when the signed-in account
+    /// isn't a host (backend 403), `HostError.message` for other 4xx/5xx — and
+    /// only for the POST that creates the row. Photos that fail to follow it are
+    /// reported in the outcome instead, never thrown.
+    @discardableResult
+    func createListing(_ listing: NewListing) async throws -> CreateOutcome {
+        guard token != nil else { throw HostError.notSignedIn }
+
+        var body: [String: Any] = [
+            "title": listing.title,
+            "description": listing.description,
+            "location": listing.location,
+            "country": listing.country,
+            "price_per_night": listing.pricePerNight,
+            "bedrooms": listing.bedrooms,
+            "beds": listing.beds,
+            "bathrooms": listing.bathrooms,
+            "max_guests": listing.maxGuests,
+            "property_type": listing.propertyType,
+        ]
+        body["amenities"] = listing.amenities
+        // Host-set cancellation policy (backend `cancellation_policy` column).
+        body["cancellation_policy"] = listing.cancellationPolicy.rawValue
+        // Length-of-stay discounts (backend `weekly_discount` / `monthly_discount`
+        // columns). Always sent (0 = no discount) so the backend records them.
+        body["weekly_discount"] = max(0, min(listing.weeklyDiscount, 100))
+        body["monthly_discount"] = max(0, min(listing.monthlyDiscount, 100))
+        // Seasonal pricing (backend `weekend_price` / `weekend_days` /
+        // `monthly_prices`). The weekend rate is sent as a number when set, else
+        // null (no override), and its days travel WITH it — the pair is judged as
+        // one thing at the door (see WeekendSchedule.resolve). Sending the rate
+        // alone is what used to leave every listing on Fri + Sat no matter what
+        // the host picked.
+        if let weekend = listing.weekendPrice, weekend > 0 {
+            body["weekend_price"] = weekend
+            body["weekend_days"] = WeekendSchedule.normalize(listing.weekendDays)
+        } else {
+            body["weekend_price"] = NSNull()
+        }
+        // Only forward the months the host actually filled with a positive rate.
+        body["monthly_prices"] = listing.monthlyPrices.filter { $0.value > 0 }
+        // Curated browse region the host selected (backend `region` column).
+        if let region = listing.region?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !region.isEmpty {
+            body["region"] = region
+        }
+        // The resort / compound: EITHER the catalog id or the host's own text,
+        // never both — a CHECK constraint enforces the pair server-side, and
+        // `resolveResortSelection` reads an id as the final answer. Neither is
+        // sent when the host said "not in a resort", which is a real answer and
+        // not a missing one.
+        if let resortId = listing.resortId?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !resortId.isEmpty {
+            body["resort_id"] = resortId
+        } else if let typed = ResortChoice.normalizeName(listing.resortName) {
+            body["resort_name"] = typed
+        }
+        // Include the pin-picker coordinate when the host placed one. Sent as
+        // top-level `lat`/`lng` so the listing shows up on the Explore map.
+        if let lat = listing.lat, let lng = listing.lng {
+            body["lat"] = lat
+            body["lng"] = lng
+        }
+
+        // Everything above is text. The photos and the ownership document are the
+        // only multi-MB things a host sends, and all of them in one body is what
+        // Vercel refused with a bare 413 before the function ran — so the body is
+        // measured here (a description is host-written and has no useful upper
+        // bound to assume) and the photos are dealt out across as many requests
+        // as they need. Ownership / proof document (data: URL): its presence is
+        // also what queues the new listing for review.
+        let doc = listing.ownershipDoc.trimmingCharacters(in: .whitespacesAndNewlines)
+        let fixedBytes = (try? JSONSerialization.data(withJSONObject: body).count) ?? 8_192
+        // `"ownership_doc":` and the comma around it, on top of the value itself.
+        let docBytes = doc.isEmpty ? 0 : ListingPhotoUpload.bodyBytes(doc) + 16
+        let plan = ListingPhotoUpload.plan(
+            photos: listing.images,
+            docBytes: docBytes,
+            fixedBytes: fixedBytes
+        )
+
+        // Device photos (each a data: URL or http(s) URL) in display order; `[]`
+        // when the host added none. The first image is the listing cover.
+        body["images"] = plan.withCreate
+        if !doc.isEmpty, !plan.docDeferred { body["ownership_doc"] = doc }
+
+        var created = try await postListing(body)
+
+        // The photos that did not fit. A failure here stops the run rather than
+        // trying the rest: the usual cause is the connection, and eight more
+        // doomed uploads only make the host wait longer to be told.
+        var photosMissing = 0
+        for (index, batch) in plan.appended.enumerated() {
+            do {
+                created = try await addListingPhotos(listingID: created.id, urls: batch)
+            } catch {
+                photosMissing = plan.appended[index...].reduce(0) { $0 + $1.count }
+                break
+            }
+        }
+
+        var documentMissing = false
+        if plan.docDeferred, !doc.isEmpty {
+            do {
+                created = try await resubmitOwnershipDoc(listingID: created.id, doc: doc)
+            } catch {
+                documentMissing = true
+            }
+        }
+
+        return CreateOutcome(
+            listing: created,
+            photosMissing: photosMissing,
+            documentMissing: documentMissing
+        )
+    }
+
+    /// The `POST /api/local/listings` that creates the row. Separate from
+    /// `sendListing` only for its 403, which is about the account's role rather
+    /// than about owning a listing that does not exist yet.
+    private func postListing(_ body: [String: Any]) async throws -> Listing {
+        guard let token else { throw HostError.notSignedIn }
+
+        let url = URL(string: "\(Config.apiBaseURL)/api/local/listings")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw HostError.message("Invalid response from the server.")
+        }
+        if (200...299).contains(http.statusCode) {
+            return try JSONDecoder().decode(Listing.self, from: data)
+        }
+        if http.statusCode == 401 { throw HostError.notSignedIn }
+        if http.statusCode == 403 {
+            throw HostError.forbidden(Self.decodeError(data) ?? "Only hosts can create listings.")
+        }
+        throw HostError.message(Self.decodeError(data) ?? "Couldn't create the listing (\(http.statusCode)).")
+    }
+
+    // MARK: - Re-submit ownership document (host only)
+
+    /// (Re)submit a listing's ownership / proof document, re-queuing it for
+    /// review (`PATCH /api/local/listings/:id` (Bearer) `{ ownership_doc }`).
+    /// `doc` is a `data:image/*;base64,…` or `data:application/pdf;base64,…`
+    /// URL produced by `OwnershipDocPicker`. The backend flips `approval_status` back to
+    /// "pending" and echoes the updated listing.
+    @discardableResult
+    func resubmitOwnershipDoc(listingID: String, doc: String) async throws -> Listing {
+        try await sendListing(
+            method: "PATCH",
+            path: "/api/local/listings/\(Self.pathEscape(listingID))",
+            body: ["ownership_doc": doc],
+            failure: "Couldn't submit the document"
+        )
+    }
+
+    // MARK: - Edit listing (host only) → back to admin review
+
+    /// Everything the host "Edit listing" form can change, in the same field set
+    /// (and with the same rules) as `NewListing`. Photos are **not** here: they
+    /// go through the dedicated `/images` endpoints so an edit never re-uploads
+    /// the photos that didn't change.
+    ///
+    /// Every field sent re-queues the listing for admin review — the backend
+    /// flips `approval_status` to "pending" and `is_published` to false in the
+    /// same statement — so the editor warns the host before it calls this.
+    struct ListingEdit {
+        var title: String
+        var description: String
+        var location: String
+        var country: String
+        /// Curated area (e.g. "North Coast"). Sent as `region`; omitted when nil
+        /// so a listing without one keeps its current value.
+        var region: String?
+        /// The catalog resort, sent as `resort_id`. See `NewListing.resortId`.
+        var resortId: String? = nil
+        /// A host-typed resort / compound name, sent as `resort_name`.
+        var resortName: String? = nil
+        /// Whether the host TOUCHED the resort field at all. Only then are the
+        /// two columns written: a PATCH that omits them leaves what is stored
+        /// alone, and sending "no resort" for an untouched field is how an edit
+        /// to the price would quietly clear a compound the host chose on the web.
+        var resortEdited: Bool = false
+        var pricePerNight: Double
+        var bedrooms: Int
+        var beds: Int
+        var bathrooms: Int
+        var maxGuests: Int
+        var propertyType: String
+        var amenities: [String] = []
+        var cancellationPolicy: CancellationPolicy = .moderate
+        var weeklyDiscount: Int = 0
+        var monthlyDiscount: Int = 0
+        var weekendPrice: Double? = nil
+        /// Which weekdays the weekend rate is charged on (`0`=Sun … `6`=Sat).
+        /// Seeded from what is stored, so opening the editor and saving without
+        /// touching the picker cannot move a host's weekend.
+        var weekendDays: [Int] = WeekendSchedule.defaultDays
+        var monthlyPrices: [String: Double] = [:]
+        /// A **newly attached** ownership document (an image or a PDF data URL).
+        /// Empty means "leave the one already on file alone" — the field is then
+        /// omitted from the body entirely.
+        var ownershipDoc: String = ""
+        /// Pin-picker coordinate; both are sent together or not at all.
+        var lat: Double?
+        var lng: Double?
+
+        /// Seed the editor from the listing the host tapped, so the form opens
+        /// showing exactly what is live today.
+        init(listing: Listing) {
+            title = listing.title
+            description = listing.description ?? ""
+            location = listing.location ?? ""
+            country = listing.country ?? ""
+            region = listing.region
+            resortId = listing.resortId
+            // Only the free-text name seeds the box: when the listing points at a
+            // catalog row, `resort` is that row's name and re-sending it as text
+            // would ask the server to re-resolve a question already answered.
+            resortName = listing.resortId == nil ? listing.resort : nil
+            pricePerNight = listing.pricePerNight
+            // A NULL column is a question nobody asked, so it opens at the
+            // floor rather than at 0 — see ListingCapacityPolicy.seed. A stored
+            // 0 (a listing published before the floor existed) is shown as it
+            // is, and the editor blocks Save until the host raises it.
+            bedrooms = ListingCapacityPolicy.seed(listing.bedrooms)
+            beds = ListingCapacityPolicy.seed(listing.beds)
+            bathrooms = ListingCapacityPolicy.seed(listing.bathrooms)
+            maxGuests = ListingCapacityPolicy.seed(listing.maxGuests)
+            propertyType = listing.propertyType ?? ""
+            amenities = listing.amenities
+            cancellationPolicy = listing.policy
+            weeklyDiscount = listing.weeklyDiscount
+            monthlyDiscount = listing.monthlyDiscount
+            weekendPrice = listing.weekendPrice
+            // `effective` and not the raw value: a listing whose host never chose
+            // is priced on the default weekend, so that is what the picker must
+            // open on — otherwise it would show nothing lit under a live rate.
+            weekendDays = WeekendSchedule.effective(listing.weekendDays)
+            monthlyPrices = listing.monthlyPrices
+            lat = listing.lat
+            lng = listing.lng
+        }
+    }
+
+    /// Save a host's edits to their own listing
+    /// (`PATCH /api/local/listings/:id`). Ownership is enforced server-side in
+    /// the SQL, so someone else's listing answers 403 → `HostError.forbidden`.
+    /// Returns the updated listing, whose `approval_status` is already "pending"
+    /// — the caller can show "Under review" without a refetch.
+    @discardableResult
+    func updateListing(id: String, _ edit: ListingEdit) async throws -> Listing {
+        var body: [String: Any] = [
+            "title": edit.title,
+            "description": edit.description,
+            "location": edit.location,
+            "country": edit.country,
+            "price_per_night": edit.pricePerNight,
+            "bedrooms": edit.bedrooms,
+            "beds": edit.beds,
+            "bathrooms": edit.bathrooms,
+            "max_guests": edit.maxGuests,
+            "property_type": edit.propertyType,
+            "amenities": edit.amenities,
+            "cancellation_policy": edit.cancellationPolicy.rawValue,
+            "weekly_discount": max(0, min(edit.weeklyDiscount, 100)),
+            "monthly_discount": max(0, min(edit.monthlyDiscount, 100)),
+        ]
+        // Weekend rate + the days it applies to: a number when set, else null
+        // (clears any override, and the server clears the days with it) — the
+        // same encoding the create request uses.
+        if let weekend = edit.weekendPrice, weekend > 0 {
+            body["weekend_price"] = weekend
+            body["weekend_days"] = WeekendSchedule.normalize(edit.weekendDays)
+        } else {
+            body["weekend_price"] = NSNull()
+        }
+        body["monthly_prices"] = edit.monthlyPrices.filter { $0.value > 0 }
+        if let region = edit.region?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !region.isEmpty {
+            body["region"] = region
+        }
+        // Sent only when the host actually changed the resort — see
+        // `resortEdited`. An explicit null on both is how "take this listing out
+        // of its compound" is said; the server clears the pair and keeps the
+        // region the host chose.
+        if edit.resortEdited {
+            if let resortId = edit.resortId?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !resortId.isEmpty {
+                body["resort_id"] = resortId
+                body["resort_name"] = NSNull()
+            } else if let typed = ResortChoice.normalizeName(edit.resortName) {
+                body["resort_id"] = NSNull()
+                body["resort_name"] = typed
+            } else {
+                body["resort_id"] = NSNull()
+                body["resort_name"] = NSNull()
+            }
+        }
+        // Only sent when the host attached a NEW document; otherwise the listing
+        // keeps the one already on file.
+        let trimmedDoc = edit.ownershipDoc.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedDoc.isEmpty {
+            body["ownership_doc"] = trimmedDoc
+        }
+        if let lat = edit.lat, let lng = edit.lng {
+            body["lat"] = lat
+            body["lng"] = lng
+        }
+
+        return try await sendListing(
+            method: "PATCH",
+            path: "/api/local/listings/\(Self.pathEscape(id))",
+            body: body,
+            failure: "Couldn't save your changes"
+        )
+    }
+
+    // MARK: - Listing photos (host only) → back to admin review
+
+    /// Append photos to a listing (`POST /api/local/listings/:id/images`). Each
+    /// entry is a `data:image/*;base64,…` URL produced by
+    /// `QKAvatarImage.makeDataURL` (or an `http(s)` URL). They land after the
+    /// existing photos, in the order given.
+    ///
+    /// ONE request, so callers must hand it a batch that fits the body limit —
+    /// `ListingPhotoUpload.batches` decides what fits. Passing ten phone photos
+    /// at once is the 413 this call exists to route around. Batching is left to
+    /// the caller because it is the caller that knows how to resume: the editor
+    /// re-seeds its photo rows from every response, so a batch that fails is
+    /// retried without re-uploading the ones that landed.
+    @discardableResult
+    func addListingPhotos(listingID: String, urls: [String]) async throws -> Listing {
+        try await sendListing(
+            method: "POST",
+            path: "/api/local/listings/\(Self.pathEscape(listingID))/images",
+            body: ["images": urls],
+            failure: "Couldn't add the photos"
+        )
+    }
+
+    /// Remove one photo (`DELETE /api/local/listings/:id/images/:imageId`). The
+    /// remaining photos are re-packed server-side, so deleting the cover
+    /// promotes the next photo.
+    @discardableResult
+    func deleteListingPhoto(listingID: String, imageID: String) async throws -> Listing {
+        try await sendListing(
+            method: "DELETE",
+            path: "/api/local/listings/\(Self.pathEscape(listingID))/images/\(Self.pathEscape(imageID))",
+            body: nil,
+            failure: "Couldn't remove the photo"
+        )
+    }
+
+    /// Reorder the whole photo set (`PATCH /api/local/listings/:id/images`).
+    /// `imageIDs` must list every photo of the listing exactly once; index 0
+    /// becomes the cover. Covers both "reorder" and "set as cover".
+    @discardableResult
+    func setListingPhotoOrder(listingID: String, imageIDs: [String]) async throws -> Listing {
+        try await sendListing(
+            method: "PATCH",
+            path: "/api/local/listings/\(Self.pathEscape(listingID))/images",
+            body: ["order": imageIDs],
+            failure: "Couldn't reorder the photos"
+        )
+    }
+
+    /// Shared transport for every host listing mutation: one authenticated
+    /// request that decodes the echoed listing. `failure` is the fallback text
+    /// when the server sends no `error` of its own.
+    private func sendListing(
+        method: String,
+        path: String,
+        body: [String: Any]?,
+        failure: String
+    ) async throws -> Listing {
+        guard let token else { throw HostError.notSignedIn }
+
+        let url = URL(string: "\(Config.apiBaseURL)\(path)")!
+        var request = URLRequest(url: url)
+        request.httpMethod = method
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        if let body {
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        }
+
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw HostError.message("Invalid response from the server.")
+        }
+        if (200...299).contains(http.statusCode) {
+            return try JSONDecoder().decode(Listing.self, from: data)
+        }
+        if http.statusCode == 401 { throw HostError.notSignedIn }
+        if http.statusCode == 403 {
+            throw HostError.forbidden(Self.decodeError(data) ?? "You can only update your own listings.")
+        }
+        throw HostError.message(Self.decodeError(data) ?? "\(failure) (\(http.statusCode)).")
+    }
+
+    // MARK: - Listing visibility (host only)
+
+    /// What the backend did when the host flipped a listing's visibility.
+    /// `PATCH /api/local/host/listings/:id/visibility` echoes this.
+    struct ListingVisibilityResult: Decodable {
+        let isPublished: Bool
+        /// Booking requests the deactivate declined. Zero on a reactivate.
+        let declinedRequests: Int
+        /// On a reactivate that did NOT go live, who is still holding the
+        /// listing down: "verification" | "staff" | "rejected" | "under_review".
+        /// Nil when the listing really is visible again.
+        let blockedBy: String?
+        /// The server's own sentence for `blockedBy`, empty when unblocked. Not
+        /// shown to the host — the app localizes it — but kept so a state the
+        /// app has no string for can still say something true.
+        let blockedMessage: String?
+        /// The refreshed listing, so the row can update without a refetch.
+        let listing: Listing?
+
+        enum CodingKeys: String, CodingKey {
+            case isPublished = "is_published"
+            case declinedRequests = "declined_requests"
+            case blockedBy = "blocked_by"
+            case blockedMessage = "blocked_message"
+            case listing
+        }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            isPublished = try c.decodeIfPresent(Bool.self, forKey: .isPublished) ?? false
+            declinedRequests = try c.decodeIfPresent(Int.self, forKey: .declinedRequests) ?? 0
+            blockedBy = try c.decodeIfPresent(String.self, forKey: .blockedBy)
+            blockedMessage = try c.decodeIfPresent(String.self, forKey: .blockedMessage)
+            listing = try c.decodeIfPresent(Listing.self, forKey: .listing)
+        }
+    }
+
+    /// The host takes their own listing off the market, or puts it back
+    /// (`PATCH /api/local/host/listings/:id/visibility`).
+    ///
+    /// This is Quick In's "delete my listing", and it deletes nothing. Bookings,
+    /// reviews, messages and payment records all point at the listing id, so the
+    /// row must survive; instead `is_published` goes false — search drops the
+    /// listing, its public page 404s and no new booking can be made — while every
+    /// existing reservation stays exactly as it was.
+    ///
+    /// **Deactivating declines every booking request still waiting on this host**
+    /// (`declinedRequests` says how many). Warn first, with the count from the
+    /// listing's `pendingRequestCount`, before calling this.
+    ///
+    /// Reactivating clears only the host's own flag. When an account block, the
+    /// identity gate or the review queue still holds the listing, the result comes
+    /// back `isPublished == false` with `blockedBy` naming who — say that rather
+    /// than claiming the listing is live.
+    @discardableResult
+    func setListingPublished(listingID: String, isPublished: Bool) async throws -> ListingVisibilityResult {
+        guard let token else { throw HostError.notSignedIn }
+
+        let url = URL(string: "\(Config.apiBaseURL)/api/local/host/listings/\(Self.pathEscape(listingID))/visibility")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "PATCH"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["is_published": isPublished])
+
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw HostError.message("Invalid response from the server.")
+        }
+        if (200...299).contains(http.statusCode) {
+            return try JSONDecoder().decode(ListingVisibilityResult.self, from: data)
+        }
+        if http.statusCode == 401 { throw HostError.notSignedIn }
+        if http.statusCode == 403 {
+            throw HostError.forbidden(Self.decodeError(data) ?? "You can only change your own listings.")
+        }
+        throw HostError.message(Self.decodeError(data) ?? "Couldn't update the listing (\(http.statusCode)).")
+    }
+
+    // MARK: - Become a host (application → admin review)
+
+    /// The fields the "Become a host" form collects. Sent as the body of
+    /// `POST /api/local/host/apply`.
+    struct HostApplicationDraft {
+        var fullName: String = ""
+        var nationalID: String = ""
+        var phone: String = ""
+        var address: String = ""
+        /// Company / brokerage display name — only sent for the business types.
+        var company: String = ""
+        var hostType: HostType = .individual
+        var notes: String = ""
+        /// Which document was photographed. The reviewer checks the photo against
+        /// it, which is why the API refuses an unknown value rather than assuming.
+        var docType: IDDocumentType = .nationalID
+        /// Both sides of that document, as `data:image/jpeg;base64,…` URLs.
+        ///
+        /// Nil for an applicant whose identity is already verified or already in
+        /// the reviewer's queue — the server then links this application to the
+        /// submission on file (`IdentityRules.needsIdentityDocuments`). For
+        /// anyone else they are required: an application the reviewer cannot
+        /// check the declared name and national ID against is refused.
+        var idFront: String?
+        var idBack: String?
+    }
+
+    /// The signed-in account's application + its server-derived status. Used to
+    /// prefill the form when a rejected applicant reapplies and to date the
+    /// "under review" card.
+    func fetchHostApplication() async throws -> HostApplicationState {
+        try await get("\(Config.apiBaseURL)/api/local/host/application", as: HostApplicationState.self)
+    }
+
+    /// Submit (or re-submit, after a rejection) the host application.
+    ///
+    /// This does **not** make the account a host — the backend files it as
+    /// `pending` for an admin to review in `/ops` and echoes the new
+    /// `host_status`. Only that approval flips `is_host`, which the client picks
+    /// up from `GET /api/auth/me` (`AuthStore.refreshSession`).
+    ///
+    /// The ID documents travel WITH the application — the reviewer approves host
+    /// status and identity in one decision, and the API refuses an application it
+    /// has no document to review.
+    ///
+    /// Throws `HostError.message` with the server's text for the documented 4xx
+    /// cases (400 validation, 409 "Already a host" / "Application already under
+    /// review") so the form can show it inline.
+    @discardableResult
+    func submitHostApplication(_ draft: HostApplicationDraft) async throws -> HostStatus {
+        guard let token else { throw HostError.notSignedIn }
+
+        let url = URL(string: "\(Config.apiBaseURL)/api/local/host/apply")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+
+        var body: [String: Any] = [
+            "full_name": draft.fullName.trimmingCharacters(in: .whitespacesAndNewlines),
+            "national_id": draft.nationalID.trimmingCharacters(in: .whitespacesAndNewlines),
+            "phone": draft.phone.trimmingCharacters(in: .whitespacesAndNewlines),
+            "address": draft.address.trimmingCharacters(in: .whitespacesAndNewlines),
+            "host_type": draft.hostType.rawValue,
+        ]
+        // Company only applies to the business host types; notes are optional.
+        let company = draft.company.trimmingCharacters(in: .whitespacesAndNewlines)
+        if draft.hostType.isBusiness, !company.isEmpty {
+            body["company"] = company
+        }
+        let notes = draft.notes.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !notes.isEmpty {
+            body["notes"] = notes
+        }
+        // Omitted entirely, not sent empty, when the identity is already on file:
+        // their absence is what tells the server to reuse that submission.
+        if let front = draft.idFront, let back = draft.idBack, !front.isEmpty, !back.isEmpty {
+            body["doc_type"] = draft.docType.rawValue
+            body["id_front"] = front
+            body["id_back"] = back
+        }
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw HostError.message("Invalid response from the server.")
+        }
+        if (200...299).contains(http.statusCode) {
+            struct ApplyResponse: Decodable {
+                let hostStatus: String?
+                enum CodingKeys: String, CodingKey { case hostStatus = "host_status" }
+            }
+            let decoded = try? JSONDecoder().decode(ApplyResponse.self, from: data)
+            // The backend always files an application as pending; fall back to
+            // that when it omits the field.
+            let status = HostStatus(raw: decoded?.hostStatus)
+            return status == .none ? .pending : status
+        }
+        if http.statusCode == 401 { throw HostError.notSignedIn }
+        throw HostError.message(Self.decodeError(data) ?? "Couldn't submit your application (\(http.statusCode)).")
+    }
+
+    // MARK: - Host reservations
+
+    /// Reservation requests across all of the host's listings.
+    func fetchHostBookings() async throws -> [HostBooking] {
+        try await get("\(Config.apiBaseURL)/api/local/host/bookings", as: [HostBooking].self)
+    }
+
+    /// The host's own listings.
+    func fetchHostListings() async throws -> [Listing] {
+        try await get("\(Config.apiBaseURL)/api/local/host/listings", as: [Listing].self)
+    }
+
+    /// Whether this host may add a listing, and if not, why — so the wizard can
+    /// say so before they fill it in. The create endpoint enforces the same rule.
+    func fetchListingGate() async throws -> ListingGate {
+        try await get("\(Config.apiBaseURL)/api/local/host/listing-gate", as: ListingGate.self)
+    }
+
+    /// The platform commission, so the add/edit-listing screens can tell a host
+    /// what guests will pay for the price they are typing. Auth-gated server-side:
+    /// guests see one inclusive price, and the rate divides back out to the raw one.
+    func fetchCommission() async throws -> CommissionInfo {
+        try await get("\(Config.apiBaseURL)/api/local/host/commission", as: CommissionInfo.self)
+    }
+
+    /// Confirm or reject a pending reservation. `action` is `confirm` or `reject`.
+    @discardableResult
+    func updateBooking(id: String, action: HostBookingAction) async throws -> HostBooking? {
+        guard let token else { throw HostError.notSignedIn }
+
+        let url = URL(string: "\(Config.apiBaseURL)/api/local/bookings/\(id)")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "PATCH"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["status": action.rawValue])
+
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw HostError.message("Invalid response from the server.")
+        }
+        if (200...299).contains(http.statusCode) {
+            // The updated booking is returned, but the caller can refresh anyway.
+            return try? JSONDecoder().decode(HostBooking.self, from: data)
+        }
+        if http.statusCode == 401 { throw HostError.notSignedIn }
+        throw HostError.message(Self.decodeError(data) ?? "Couldn't update the request (\(http.statusCode)).")
+    }
+
+    // MARK: - Reservation detail
+
+    /// A single reservation's full detail (drives the detail screen + QR).
+    func fetchReservation(id: String) async throws -> ReservationDetail {
+        try await get("\(Config.apiBaseURL)/api/local/bookings/\(id)", as: ReservationDetail.self)
+    }
+
+    // MARK: - Stay guide (host-authored content on a confirmed booking)
+
+    /// The fields the stay-guide editor collects for one item. Sent as the body
+    /// of the create/update calls.
+    struct StayGuideDraft {
+        var kind: StayGuideKind = .info
+        var title: String = ""
+        /// Info text, or the caption of a photo / file / place link.
+        var body: String = ""
+        /// A `data:image/*;base64,…` URL (photo / attached file) produced by
+        /// `QKAvatarImage.makeDataURL`, or an `https://` link (place QR, remote
+        /// file). Empty for a plain info block.
+        var url: String = ""
+        /// Display position within the guide. Appended at the end on create.
+        var order: Int = 0
+
+        init(kind: StayGuideKind = .info, order: Int = 0) {
+            self.kind = kind
+            self.order = order
+        }
+
+        /// Seed the editor from an existing item (the "edit" path).
+        init(item: StayGuideItem) {
+            kind = item.guideKind
+            title = item.titleText ?? ""
+            body = item.bodyText ?? ""
+            url = item.urlText ?? ""
+            order = item.order ?? 0
+        }
+    }
+
+    /// A booking's stay-guide items — readable by the listing's host **and** by
+    /// that booking's guest (the backend enforces it; 403 otherwise).
+    func fetchStayGuide(bookingID: String) async throws -> [StayGuideItem] {
+        let encoded = bookingID.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? bookingID
+        return try await get("\(Config.apiBaseURL)/api/local/bookings/\(encoded)/stay-guide",
+                             as: [StayGuideItem].self)
+    }
+
+    /// Add an item to a booking's stay guide
+    /// (`POST /api/local/bookings/:id/stay-guide`). Host of that listing only,
+    /// and only once the booking is confirmed — the backend re-checks both.
+    @discardableResult
+    func createStayGuideItem(bookingID: String, draft: StayGuideDraft) async throws -> StayGuideItem {
+        try await sendStayGuide(
+            method: "POST",
+            path: "/api/local/bookings/\(Self.pathEscape(bookingID))/stay-guide",
+            draft: draft
+        )
+    }
+
+    /// Edit an existing item (`PATCH …/stay-guide/:itemId`). Host only.
+    @discardableResult
+    func updateStayGuideItem(bookingID: String, itemID: String, draft: StayGuideDraft) async throws -> StayGuideItem {
+        try await sendStayGuide(
+            method: "PATCH",
+            path: "/api/local/bookings/\(Self.pathEscape(bookingID))/stay-guide/\(Self.pathEscape(itemID))",
+            draft: draft
+        )
+    }
+
+    /// Reorder one item (`PATCH …/stay-guide/:itemId` with just `order`). Host
+    /// only. Sent for each of the two rows a move swaps.
+    func setStayGuideOrder(bookingID: String, itemID: String, order: Int) async throws {
+        guard let token else { throw HostError.notSignedIn }
+
+        let path = "/api/local/bookings/\(Self.pathEscape(bookingID))/stay-guide/\(Self.pathEscape(itemID))"
+        let url = URL(string: "\(Config.apiBaseURL)\(path)")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "PATCH"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["order": order])
+
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw HostError.message("Invalid response from the server.")
+        }
+        if (200...299).contains(http.statusCode) { return }
+        if http.statusCode == 401 { throw HostError.notSignedIn }
+        if http.statusCode == 403 {
+            throw HostError.forbidden(Self.decodeError(data) ?? "Only the listing's host can edit the stay guide.")
+        }
+        throw HostError.message(Self.decodeError(data) ?? "Couldn't reorder the guide (\(http.statusCode)).")
+    }
+
+    /// Remove an item (`DELETE …/stay-guide/:itemId`). Host only.
+    func deleteStayGuideItem(bookingID: String, itemID: String) async throws {
+        guard let token else { throw HostError.notSignedIn }
+
+        let path = "/api/local/bookings/\(Self.pathEscape(bookingID))/stay-guide/\(Self.pathEscape(itemID))"
+        let url = URL(string: "\(Config.apiBaseURL)\(path)")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "DELETE"
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw HostError.message("Invalid response from the server.")
+        }
+        if (200...299).contains(http.statusCode) { return }
+        if http.statusCode == 401 { throw HostError.notSignedIn }
+        if http.statusCode == 403 {
+            throw HostError.forbidden(Self.decodeError(data) ?? "Only the listing's host can edit the stay guide.")
+        }
+        throw HostError.message(Self.decodeError(data) ?? "Couldn't remove the item (\(http.statusCode)).")
+    }
+
+    /// Shared create/update transport: validates the draft, PUTs the JSON body
+    /// and decodes the echoed item.
+    private func sendStayGuide(method: String, path: String, draft: StayGuideDraft) async throws -> StayGuideItem {
+        guard let token else { throw HostError.notSignedIn }
+        let body = try await Self.stayGuideBody(draft)
+
+        let url = URL(string: "\(Config.apiBaseURL)\(path)")!
+        var request = URLRequest(url: url)
+        request.httpMethod = method
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw HostError.message("Invalid response from the server.")
+        }
+        if (200...299).contains(http.statusCode) {
+            return try JSONDecoder().decode(StayGuideItem.self, from: data)
+        }
+        if http.statusCode == 401 { throw HostError.notSignedIn }
+        if http.statusCode == 403 {
+            throw HostError.forbidden(
+                Self.decodeError(data) ?? "Only the listing's host can edit the stay guide, once the booking is confirmed."
+            )
+        }
+        throw HostError.message(Self.decodeError(data) ?? "Couldn't save the item (\(http.statusCode)).")
+    }
+
+    /// Validate a draft and build its JSON body. Mirrors the server rules so a
+    /// bad item is rejected inline instead of round-tripping: the four kinds,
+    /// `data:`/`http(s)` for an upload, `http(s)` **only** for a place link
+    /// (never `data:`/`javascript:`), and the length caps. `@MainActor` so the
+    /// messages it throws come out of the localized string table.
+    @MainActor
+    static func stayGuideBody(_ draft: StayGuideDraft) throws -> [String: Any] {
+        let title = draft.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let text = draft.body.trimmingCharacters(in: .whitespacesAndNewlines)
+        let link = draft.url.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if title.count > StayGuideRules.maxTitleChars || text.count > StayGuideRules.maxBodyChars {
+            throw HostError.message(L.t("guide.error.tooLong"))
+        }
+
+        switch draft.kind {
+        case .info:
+            if title.isEmpty && text.isEmpty {
+                throw HostError.message(L.t("guide.error.info"))
+            }
+        case .photo:
+            guard !link.isEmpty, StayGuideRules.isUploadURL(link) else {
+                throw HostError.message(L.t("guide.error.photo"))
+            }
+        case .attachment:
+            guard !link.isEmpty, StayGuideRules.isUploadURL(link) else {
+                throw HostError.message(L.t("guide.error.file"))
+            }
+        case .placeQR:
+            guard StayGuideRules.isWebLink(link) else {
+                throw HostError.message(L.t("guide.error.link"))
+            }
+        }
+        if link.count > StayGuideRules.maxURLChars {
+            throw HostError.message(L.t("guide.error.tooLarge"))
+        }
+
+        var body: [String: Any] = [
+            "kind": draft.kind.rawValue,
+            "order": max(0, draft.order),
+        ]
+        body["title"] = title.isEmpty ? NSNull() : title
+        body["body"] = text.isEmpty ? NSNull() : text
+        body["url"] = link.isEmpty ? NSNull() : link
+        return body
+    }
+
+    /// Percent-encode an id for use as a path segment.
+    private static func pathEscape(_ value: String) -> String {
+        value.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? value
+    }
+
+    // MARK: - Money (host earnings + guest receipts)
+
+    /// The signed-in host's earnings + payout summary (drives the Earnings view).
+    /// Maps 403 to `.forbidden` (account isn't a host) and 401 to `.notSignedIn`.
+    func fetchHostEarnings() async throws -> HostEarnings {
+        try await get("\(Config.apiBaseURL)/api/local/host/earnings", as: HostEarnings.self)
+    }
+
+    /// The signed-in guest's paid receipts, itemized (drives the Receipts view).
+    func fetchReceipts() async throws -> [GuestReceipt] {
+        try await get("\(Config.apiBaseURL)/api/local/receipts", as: [GuestReceipt].self)
+    }
+
+    // MARK: - Host analytics (Section 10)
+
+    /// The signed-in host's analytics dashboard (bookings, revenue, rating,
+    /// conversion, monthly trend, top listings). Maps 403 to `.forbidden`
+    /// (account isn't a host) and 401 to `.notSignedIn`.
+    func fetchAnalytics() async throws -> HostAnalytics {
+        try await get("\(Config.apiBaseURL)/api/local/host/analytics", as: HostAnalytics.self)
+    }
+
+    /// Fetch the multi-currency FX rates (`GET /api/local/currencies`). Public —
+    /// no auth. Powers the in-app currency switcher; the caller falls back to the
+    /// baked-in `CurrencyRates.fallback` when this throws (offline / non-2xx).
+    func fetchCurrencyRates() async throws -> CurrencyRates {
+        let url = URL(string: "\(Config.apiBaseURL)/api/local/currencies")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw HostError.message("Invalid response from the server.")
+        }
+        guard (200...299).contains(http.statusCode) else {
+            throw HostError.message("Couldn't load currency rates (\(http.statusCode)).")
+        }
+        return try JSONDecoder().decode(CurrencyRates.self, from: data)
+    }
+
+    // MARK: - Helpers
+
+    /// Authenticated GET → decoded `T`. Maps 401 to `.notSignedIn`.
+    private func get<T: Decodable>(_ urlString: String, as type: T.Type) async throws -> T {
+        guard let token else { throw HostError.notSignedIn }
+
+        let url = URL(string: urlString)!
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw HostError.message("Invalid response from the server.")
+        }
+        if http.statusCode == 401 { throw HostError.notSignedIn }
+        if http.statusCode == 403 {
+            throw HostError.forbidden(Self.decodeError(data) ?? "You don't have access to that.")
+        }
+        guard (200...299).contains(http.statusCode) else {
+            throw HostError.message(Self.decodeError(data) ?? "Request failed (\(http.statusCode)).")
+        }
+        return try JSONDecoder().decode(T.self, from: data)
+    }
+
+    private static func decodeError(_ data: Data) -> String? {
+        struct ErrorBody: Decodable { let error: String }
+        return (try? JSONDecoder().decode(ErrorBody.self, from: data))?.error
+    }
+}
+
+/// The PATCH action sent to confirm or reject a reservation.
+enum HostBookingAction: String {
+    case confirm
+    case reject
+}
+
+/// Errors surfaced to the host + reservation-detail UI.
+enum HostError: LocalizedError {
+    case notSignedIn
+    case forbidden(String)
+    case message(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .notSignedIn:        return "Sign in to continue"
+        case let .forbidden(text): return text
+        case let .message(text):   return text
+        }
+    }
+}
+
+/// Decodes the `{ error, policyWarning: { id, message } }` body the API answers
+/// with (HTTP 409) while a moderator's warning is unacknowledged — on a listing
+/// comment or a host reply. Returns nil for any other body, so callers can fall
+/// through to their normal error handling.
+enum PolicyWarningBody {
+    static func decode(_ data: Data) -> (id: String, message: String)? {
+        struct Body: Decodable {
+            struct Warning: Decodable { let id: String; let message: String }
+            let policyWarning: Warning?
+        }
+        guard let w = (try? JSONDecoder().decode(Body.self, from: data))?.policyWarning else { return nil }
+        return (w.id, w.message)
+    }
+}
+
+/// The user's acknowledgement of a policy warning.
+/// `POST {base}/api/local/policy-warning { id }` — until this succeeds every
+/// comment or host reply answers 409 with the same warning.
+enum PolicyWarningService {
+    static func acknowledge(id: String) async throws {
+        let stored = UserDefaults.standard.string(forKey: AuthStore.tokenKey)
+        guard let token = stored, !token.isEmpty else { throw HostError.notSignedIn }
+        let url = URL(string: "\(Config.apiBaseURL)/api/local/policy-warning")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["id": id])
+        let (_, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+            throw HostError.message("Couldn't save that. Please try again.")
+        }
+    }
+}

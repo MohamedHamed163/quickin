@@ -1,0 +1,701 @@
+import SwiftUI
+
+/// The authentication screen: email sign in / sign up plus the **real**
+/// "Continue with Google" social option.
+struct AuthView: View {
+    @EnvironmentObject private var auth: AuthStore
+    @EnvironmentObject private var loc: LocalizationManager
+
+    private enum Mode: String, CaseIterable {
+        case signIn
+        case signUp
+    }
+
+    /// The text fields we track focus for, so leaving the email field can flip
+    /// its validation hint on.
+    private enum Field: Hashable { case name, email }
+
+    @State private var mode: Mode = .signIn
+    @State private var name = ""
+    @State private var email = ""
+    @State private var password = ""
+    @State private var showPassword = false
+    /// Sign-up only: the password typed a second time. A new account whose
+    /// password holds a typo can't be signed into at all, so we ask twice.
+    @State private var confirmPassword = ""
+    @State private var showConfirmPassword = false
+
+    @FocusState private var focusedField: Field?
+
+    /// Set once the user has left the email field (or hit return on it) with
+    /// something typed. Until then we stay quiet — nagging about a malformed
+    /// address while it's still being typed reads as broken.
+    @State private var emailTouched = false
+
+    /// The same arming for the name field: a half-typed "L" is not yet a wrong
+    /// answer, so the hint waits until focus leaves (or submit is attempted).
+    @State private var nameTouched = false
+
+    /// Identifiable wrapper so the OTP email can drive a `fullScreenCover(item:)`.
+    private struct OTPSession: Identifiable {
+        let email: String
+        /// Fallback code the backend returns when SMTP delivery failed, so the
+        /// user isn't stranded waiting for an email that never arrives.
+        let devCode: String?
+        var id: String { email }
+    }
+
+    /// When non-nil, the OTP verification screen is presented for this email
+    /// (set after a `pending` signup or an unverified-email login).
+    @State private var otpSession: OTPSession?
+
+    /// Drives the forgot-password reset sheet (sign-in mode only).
+    @State private var showForgotPassword = false
+
+    // MARK: Biometric sign-in state
+
+    /// What this device supports (Face ID / Touch ID / none). Resolved on appear.
+    @State private var biometricKind: BiometricAuth.Kind = .none
+    /// Whether a biometric session is on file (shows the unlock button).
+    @State private var hasStoredBiometric = false
+    /// Drives the post-login "Enable Face ID?" confirmation dialog.
+    @State private var showEnableBiometric = false
+    /// The freshly-authenticated session held until the user accepts/declines
+    /// the enable-biometric prompt (so we can store it on accept).
+    @State private var pendingBiometricSession: (token: String, user: AuthUser)?
+
+    private var isSignUp: Bool { mode == .signUp }
+
+    /// Whether to offer the "Sign in with Face ID" button: only in sign-in mode,
+    /// when the device supports biometrics and a session is stored.
+    private var canUseBiometricSignIn: Bool {
+        !isSignUp && biometricKind != .none && hasStoredBiometric
+    }
+
+    /// What is wrong with the address, under the rule this mode is subject to.
+    ///
+    /// Sign-up gets the full policy, temp-mail included. Sign-in does not: it
+    /// only ever touches an account that already exists, so refusing a
+    /// disposable domain there would lock out whoever signed up before the
+    /// blocklist without stopping a single new account. The server draws the
+    /// line in the same place (`checkEmail` vs `isValidEmail`).
+    private var emailProblem: EmailRules.Problem? {
+        guard let problem = EmailRules.problem(with: email) else { return nil }
+        if !isSignUp, problem == .disposable { return nil }
+        return problem
+    }
+
+    /// The inline hint under the email field: shown only once the user has
+    /// committed a non-empty address we would refuse. The sentence names the
+    /// actual problem — `layla@gmail.con` gets "“.con” isn't a valid domain
+    /// extension. Did you mean layla@gmail.com?", not a generic "invalid".
+    private var emailError: String? {
+        guard emailTouched, !EmailRules.normalized(email).isEmpty,
+              let problem = emailProblem else {
+            return nil
+        }
+        return EmailRules.message(for: problem, in: email)
+    }
+
+    /// The inline hint under the name field, armed the same way as the email's:
+    /// `12345` is not a name, and the server refuses it, so say so here first.
+    private var nameError: String? {
+        guard isSignUp, nameTouched, !NameRules.normalized(name).isEmpty,
+              let problem = NameRules.problem(with: name) else {
+            return nil
+        }
+        return loc.t(problem.messageKey)
+    }
+
+    /// The inline hint under the confirm field, armed the same way as the others:
+    /// it waits until something has been typed there before calling it a mismatch.
+    private var confirmError: String? {
+        guard isSignUp, !confirmPassword.isEmpty, confirmPassword != password else {
+            return nil
+        }
+        return loc.t("password.mismatch")
+    }
+
+    private var canSubmit: Bool {
+        // An address we would refuse can never sign in or sign up — gate the
+        // button on the whole rule, not just on the field being non-empty.
+        guard emailProblem == nil else { return false }
+        if isSignUp {
+            // New account: a real name + a password that clears the strength bar,
+            // typed identically twice. Non-empty is not the test — `12345` is
+            // non-empty and is not a name.
+            return NameRules.isValid(name)
+                && PasswordRules.meetsMin(password)
+                && confirmPassword == password
+        }
+        // Sign-in just needs a non-empty password; strength is enforced at signup.
+        return password.count >= 1
+    }
+
+    var body: some View {
+        ZStack {
+            LinearGradient.qkPageWash.ignoresSafeArea()
+
+            ScrollView {
+                VStack(spacing: 24) {
+                    header
+                    modePicker
+                    formCard
+                    if let error = auth.errorMessage {
+                        Text(error)
+                            .font(.footnote)
+                            .foregroundStyle(Color.qkBurgundy)
+                            .multilineTextAlignment(.center)
+                            .frame(maxWidth: .infinity, alignment: .center)
+                            .transition(.opacity)
+                    }
+                    primaryButton
+                    if canUseBiometricSignIn {
+                        biometricButton
+                    }
+                    orDivider
+                    socialButtons
+                    Spacer(minLength: 8)
+                }
+                .padding(.horizontal, 24)
+                .padding(.top, 56)
+                .padding(.bottom, 32)
+                .frame(maxWidth: 480)
+                .frame(maxWidth: .infinity)
+            }
+            .scrollDismissesKeyboard(.interactively)
+        }
+        .tint(.qkBurgundy)
+        .animation(.easeInOut(duration: 0.2), value: mode)
+        .animation(.easeInOut(duration: 0.2), value: auth.errorMessage)
+        // Switching modes starts a fresh attempt at a DIFFERENT thing, so nothing secret and
+        // nothing said about the old attempt may survive the toggle: both password fields are
+        // emptied and the server's error ("wrong email or password" from a failed sign-in says
+        // nothing about the account now being created) is dropped. The email is deliberately
+        // kept — someone whose sign-in failed and who decides to register is almost always
+        // registering that same address — and `emailTouched` is kept with it so the stricter
+        // sign-up policy can speak up straight away instead of silently disabling the button.
+        // The name is sign-up-only and never reaches the sign-in form, so an accidental toggle
+        // doesn't throw it away.
+        .onChange(of: mode) { _, _ in
+            password = ""
+            confirmPassword = ""
+            showPassword = false
+            showConfirmPassword = false
+            nameTouched = false
+            auth.errorMessage = nil
+        }
+        // Leaving a field (tapping the next one, hitting return, dismissing the
+        // keyboard) is what arms that field's hint.
+        .onChange(of: focusedField) { _, newValue in
+            if newValue != .email && !EmailRules.normalized(email).isEmpty {
+                emailTouched = true
+            }
+            if newValue != .name && !NameRules.normalized(name).isEmpty {
+                nameTouched = true
+            }
+        }
+        // OTP verification step. Presented after a `pending` signup or when a
+        // login reports the email still needs verification.
+        .fullScreenCover(item: $otpSession) { session in
+            OTPVerificationView(
+                email: session.email,
+                // Backed out without verifying: return to this form. Not a dead
+                // end — the account exists but is unverified, so signing up or
+                // signing in again re-issues a code and comes back here.
+                onBack: { otpSession = nil },
+                devCode: session.devCode,
+                onVerified: {
+                    // Verified: AuthStore now holds the session. Dismiss the OTP
+                    // cover; the parent sheet auto-dismisses on `isAuthenticated`.
+                    otpSession = nil
+                }
+            )
+            .environmentObject(auth)
+        }
+        // Forgot-password reset flow (request code → reset). On success it
+        // stores the session; the presenting sheet dismisses on `isAuthenticated`.
+        .sheet(isPresented: $showForgotPassword) {
+            ForgotPasswordView(initialEmail: email)
+                .environmentObject(auth)
+                .environmentObject(loc)
+        }
+        .animation(.easeInOut(duration: 0.2), value: canUseBiometricSignIn)
+        // Resolve biometric capability + whether a session is stored each time
+        // the screen appears (covers returning after a logout).
+        .onAppear {
+            refreshBiometricState()
+            // CLI screenshot hook: force-present the enable-Face ID sheet so its
+            // design can be captured without enrolling biometrics + logging in.
+            if UserDefaults.standard.bool(forKey: "uitestBioSheet") {
+                biometricKind = .faceID
+                showEnableBiometric = true
+            }
+            // CLI screenshot hook: force the "Sign in with Face ID" button visible.
+            if UserDefaults.standard.bool(forKey: "uitestBioButton") {
+                biometricKind = .faceID
+                hasStoredBiometric = true
+            }
+        }
+        // Offer to enable Face ID / Touch ID after a fresh password login — a
+        // custom boutique sheet (not the stock iOS dialog). Either choice commits
+        // the staged session so the user finishes signing in.
+        .overlay {
+            if showEnableBiometric {
+                BiometricEnableSheet(
+                    kind: biometricKind,
+                    onEnable: {
+                        if let session = pendingBiometricSession {
+                            BiometricAuth.shared.storeSession(token: session.token, user: session.user)
+                            hasStoredBiometric = true
+                        }
+                        showEnableBiometric = false
+                        finishAuthenticated()
+                    },
+                    onLater: {
+                        showEnableBiometric = false
+                        finishAuthenticated()
+                    }
+                )
+                .environmentObject(loc)
+                .transition(.opacity)
+                .zIndex(30)
+            }
+        }
+        .animation(.easeInOut(duration: 0.25), value: showEnableBiometric)
+    }
+
+    // MARK: - Header
+
+    private var header: some View {
+        VStack(spacing: 10) {
+            Image("logo")
+                .resizable()
+                .scaledToFit()
+                .frame(height: 56)
+            Text(loc.t("auth.tagline"))
+                .font(.subheadline)
+                .foregroundStyle(Color.qkMuted)
+        }
+        .padding(.bottom, 4)
+    }
+
+    // MARK: - Mode picker
+
+    private var modePicker: some View {
+        Picker("Mode", selection: $mode) {
+            ForEach(Mode.allCases, id: \.self) { m in
+                Text(loc.t(m == .signIn ? "auth.signIn" : "auth.signUp")).tag(m)
+            }
+        }
+        .pickerStyle(.segmented)
+    }
+
+    // MARK: - Form
+
+    private var formCard: some View {
+        VStack(spacing: 14) {
+            if isSignUp {
+                field(
+                    title: loc.t("auth.fullName"),
+                    text: $name,
+                    placeholder: loc.t("auth.fullName.placeholder"),
+                    systemImage: "person",
+                    contentType: .name,
+                    focusTag: .name,
+                    errorMessage: nameError
+                )
+            }
+            field(
+                title: loc.t("auth.email"),
+                text: $email,
+                placeholder: "layla@email.com",
+                systemImage: "envelope",
+                contentType: .emailAddress,
+                keyboard: .emailAddress,
+                focusTag: .email,
+                errorMessage: emailError
+            )
+            secureField(
+                title: loc.t("auth.password"),
+                text: $password,
+                placeholder: "••••••••",
+                systemImage: "lock",
+                isRevealed: $showPassword
+            )
+            if isSignUp {
+                PasswordStrengthView(password: password)
+                    .animation(.easeInOut(duration: 0.25), value: password.isEmpty)
+                secureField(
+                    title: loc.t("auth.confirmPassword"),
+                    text: $confirmPassword,
+                    placeholder: "••••••••",
+                    systemImage: "checkmark.shield",
+                    isRevealed: $showConfirmPassword,
+                    errorMessage: confirmError
+                )
+            }
+            if !isSignUp {
+                Button {
+                    auth.setError(nil)
+                    showForgotPassword = true
+                } label: {
+                    Text(loc.t("auth.forgotPassword"))
+                        .font(.footnote.weight(.semibold))
+                        .foregroundStyle(Color.qkBurgundy)
+                        .frame(maxWidth: .infinity, alignment: .trailing)
+                }
+                .buttonStyle(.plain)
+                .disabled(auth.isLoading)
+            }
+        }
+        .padding(18)
+        .qkCard(lifts: false)
+    }
+
+    private func field(
+        title: String,
+        text: Binding<String>,
+        placeholder: String,
+        systemImage: String,
+        contentType: UITextContentType? = nil,
+        keyboard: UIKeyboardType = .default,
+        focusTag: Field,
+        errorMessage: String? = nil
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title)
+                .font(.caption).fontWeight(.semibold)
+                .foregroundStyle(Color.qkMuted)
+            HStack(spacing: 10) {
+                Image(systemName: systemImage)
+                    .foregroundStyle(errorMessage == nil ? Color.qkMuted : Color.qkBurgundy)
+                    .frame(width: 18)
+                TextField(placeholder, text: text)
+                    .textContentType(contentType)
+                    .keyboardType(keyboard)
+                    .textInputAutocapitalization(keyboard == .emailAddress ? .never : .words)
+                    .autocorrectionDisabled(keyboard == .emailAddress)
+                    .foregroundStyle(Color.qkInk)
+                    .focused($focusedField, equals: focusTag)
+                    .submitLabel(.next)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 12)
+            .background(Color.qkCream)
+            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .strokeBorder(
+                        errorMessage == nil ? Color.qkInk.opacity(0.1) : Color.qkBurgundy.opacity(0.55),
+                        lineWidth: errorMessage == nil ? 1 : 1.5
+                    )
+            )
+            // Inline validation hint (the name and email fields use it).
+            if let errorMessage {
+                Text(errorMessage)
+                    .font(.caption)
+                    .foregroundStyle(Color.qkBurgundy)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .transition(.opacity)
+            }
+        }
+        .animation(.easeInOut(duration: 0.2), value: errorMessage)
+    }
+
+    private func secureField(
+        title: String,
+        text: Binding<String>,
+        placeholder: String,
+        systemImage: String,
+        isRevealed: Binding<Bool>,
+        errorMessage: String? = nil
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title)
+                .font(.caption).fontWeight(.semibold)
+                .foregroundStyle(Color.qkMuted)
+            HStack(spacing: 10) {
+                Image(systemName: systemImage)
+                    .foregroundStyle(errorMessage == nil ? Color.qkMuted : Color.qkBurgundy)
+                    .frame(width: 18)
+                Group {
+                    if isRevealed.wrappedValue {
+                        TextField(placeholder, text: text)
+                    } else {
+                        SecureField(placeholder, text: text)
+                    }
+                }
+                .textContentType(isSignUp ? .newPassword : .password)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled(true)
+                .foregroundStyle(Color.qkInk)
+                Button {
+                    isRevealed.wrappedValue.toggle()
+                } label: {
+                    Image(systemName: isRevealed.wrappedValue ? "eye.slash" : "eye")
+                        .foregroundStyle(Color.qkMuted)
+                        .frame(width: 18)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(loc.t(isRevealed.wrappedValue ? "auth.hidePassword" : "auth.showPassword"))
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 12)
+            .background(Color.qkCream)
+            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .strokeBorder(
+                        errorMessage == nil ? Color.qkInk.opacity(0.1) : Color.qkBurgundy.opacity(0.55),
+                        lineWidth: errorMessage == nil ? 1 : 1.5
+                    )
+            )
+            // Inline validation hint (the confirm-password field uses it).
+            if let errorMessage {
+                Text(errorMessage)
+                    .font(.caption)
+                    .foregroundStyle(Color.qkBurgundy)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .transition(.opacity)
+            }
+        }
+        .animation(.easeInOut(duration: 0.2), value: errorMessage)
+    }
+
+    // MARK: - Primary button
+
+    private var primaryButton: some View {
+        Button {
+            Task { await submit() }
+        } label: {
+            QKPrimaryButtonLabel(
+                title: loc.t(isSignUp ? "auth.createAccount" : "auth.signIn"),
+                isLoading: auth.isLoading
+            )
+            .opacity(canSubmit && !auth.isLoading ? 1 : 0.5)
+            .background(alignment: .center) {
+                if canSubmit && !auth.isLoading {
+                    QKPulseRing(cornerRadius: 16)
+                }
+            }
+        }
+        .buttonStyle(QKPressStyle())
+        .disabled(!canSubmit || auth.isLoading)
+    }
+
+    // MARK: - Biometric sign-in button
+
+    /// "Sign in with Face ID / Touch ID" — shown in sign-in mode when a session
+    /// is stored. A bordered burgundy button with the matching SF Symbol.
+    private var biometricButton: some View {
+        Button {
+            Task { await handleBiometricSignIn() }
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: biometricKind.symbol)
+                    .font(.system(size: 20, weight: .semibold))
+                Text(String(format: loc.t("biometric.signInWith"), biometricKind.displayName))
+                    .fontWeight(.semibold)
+            }
+            .frame(maxWidth: .infinity)
+            .frame(height: 52)
+            .foregroundStyle(Color.qkBurgundy)
+            .background(Color.qkSurface)
+            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .stroke(Color.qkBurgundy.opacity(0.4), lineWidth: 1.5)
+            )
+        }
+        .buttonStyle(QKPressStyle())
+        .disabled(auth.isLoading)
+        .accessibilityLabel(String(format: loc.t("biometric.signInWith"), biometricKind.displayName))
+    }
+
+    // MARK: - Divider
+
+    private var orDivider: some View {
+        HStack(spacing: 12) {
+            Rectangle().fill(Color.qkInk.opacity(0.12)).frame(height: 1)
+            Text(loc.t("common.or"))
+                .font(.footnote)
+                .foregroundStyle(Color.qkMuted)
+            Rectangle().fill(Color.qkInk.opacity(0.12)).frame(height: 1)
+        }
+        .padding(.vertical, 2)
+    }
+
+    // MARK: - Social buttons
+
+    private var socialButtons: some View {
+        VStack(spacing: 12) {
+            // Continue with Google — white button, border, "G" glyph.
+            // Gated on Config.googleClientID: empty → inline note (no demo call).
+            Button {
+                Task { await handleGoogle() }
+            } label: {
+                HStack(spacing: 8) {
+                    Text("G")
+                        .font(.system(size: 18, weight: .bold, design: .default))
+                        .foregroundStyle(Color.qkBurgundy)
+                    Text(loc.t("auth.continueWithGoogle"))
+                        .fontWeight(.semibold)
+                }
+                .frame(maxWidth: .infinity)
+                .frame(height: 52)
+                .background(Color.white)
+                .foregroundStyle(Color.qkInk)
+                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .stroke(Color.qkInk.opacity(0.18), lineWidth: 1)
+                )
+            }
+            .disabled(auth.isLoading)
+
+            if Config.googleClientID.isEmpty {
+                Text(loc.t("auth.googleNote"))
+                    .font(.caption2)
+                    .foregroundStyle(Color.qkMuted)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: .infinity)
+            }
+        }
+        .opacity(auth.isLoading ? 0.6 : 1)
+    }
+
+    // MARK: - Actions
+
+    private func submit() async {
+        // Guard again at the call site: the button is disabled for a malformed
+        // address, but the keyboard's return key / a future caller shouldn't be
+        // able to slip one past. Send the trimmed form.
+        let email = EmailRules.normalized(self.email)
+        guard emailProblem == nil else {
+            emailTouched = true
+            return
+        }
+
+        if isSignUp {
+            // Same guard as the address: the button is disabled for `12345`, but
+            // the return key shouldn't be able to slip one past. Send the
+            // collapsed form, which is what the server stores.
+            let name = NameRules.normalized(self.name)
+            guard NameRules.isValid(name) else {
+                nameTouched = true
+                return
+            }
+            // Same again for the confirmation: the button is disabled on a
+            // mismatch, but the return key shouldn't be able to slip one past.
+            guard confirmPassword == password else { return }
+            let outcome = await auth.signup(name: name, email: email, password: password)
+            await handle(outcome, session: nil)
+            return
+        }
+
+        // Sign in. When the device can offer Face ID / Touch ID and no session
+        // is stored yet, log in *deferred* so we can show the "Enable Face ID?"
+        // prompt before the presenting sheet auto-dismisses. Otherwise use the
+        // normal path (which signs in immediately).
+        if biometricKind != .none && !hasStoredBiometric {
+            let (outcome, session) = await auth.loginDeferred(email: email, password: password)
+            await handle(outcome, session: session)
+        } else {
+            let outcome = await auth.login(email: email, password: password)
+            await handle(outcome, session: nil)
+        }
+    }
+
+    /// Route an auth outcome. When `session` is non-nil the login was deferred
+    /// for the biometric opt-in prompt; otherwise the session (if any) is
+    /// already live.
+    private func handle(_ outcome: AuthOutcome, session: AuthSuccess?) async {
+        switch outcome {
+        case .authenticated:
+            if let session {
+                // Deferred path: stash the session and ask to enable biometrics.
+                // The session is committed when the prompt is answered.
+                pendingBiometricSession = (session.token, session.user)
+                showEnableBiometric = true
+            }
+            // Non-deferred path: session is already live; the presenting sheet
+            // dismisses on `auth.isAuthenticated`. Nothing to do.
+        case .needsVerification(let verifyEmail, let devCode):
+            // For an unverified-email login, send a fresh code before showing
+            // the OTP screen (signup already emailed one). Errors surface via
+            // `auth.errorMessage`.
+            if !isSignUp {
+                await auth.resendOTP(email: verifyEmail)
+            }
+            otpSession = OTPSession(email: verifyEmail, devCode: devCode)
+        case .failed:
+            break
+        }
+    }
+
+    /// Commit the staged session (from a deferred login) so the app advances
+    /// into the signed-in experience. Called after the enable-biometric prompt
+    /// is answered (enabled or not).
+    private func finishAuthenticated() {
+        guard let pending = pendingBiometricSession else { return }
+        auth.commitDeferredSession(AuthSuccess(token: pending.token, user: pending.user))
+        pendingBiometricSession = nil
+    }
+
+    /// Resolve the device's biometric capability and whether a session is on
+    /// file, so the sign-in button + opt-in prompt show only when relevant.
+    private func refreshBiometricState() {
+        biometricKind = BiometricAuth.shared.availableKind()
+        hasStoredBiometric = BiometricAuth.shared.hasStoredSession
+    }
+
+    /// Run the Face ID / Touch ID unlock: prompt → load the stored session →
+    /// adopt it (signs in). On a biometric failure we stay on the form so the
+    /// user can fall back to their password. If the stored session is missing
+    /// we clear the button and surface a note.
+    private func handleBiometricSignIn() async {
+        auth.setError(nil)
+        let ok = await BiometricAuth.shared.authenticate(reason: loc.t("biometric.reason"))
+        guard ok else {
+            // Cancel / no-match / lockout: fall back to password silently unless
+            // it was an outright failure worth noting. Keep it quiet on cancel.
+            return
+        }
+        guard let session = BiometricAuth.shared.loadStoredSession() else {
+            // Stored session vanished (e.g. cleared elsewhere): hide the button.
+            BiometricAuth.shared.clearStoredSession()
+            hasStoredBiometric = false
+            auth.setError(loc.t("biometric.sessionExpired"))
+            return
+        }
+        // Adopt the stored token + user → signs in (sheet dismisses reactively).
+        auth.adopt(token: session.token, user: session.user)
+    }
+
+    /// Run the real Google OAuth flow (ASWebAuthenticationSession + PKCE) and
+    /// POST the resulting id_token to `/api/auth/google`. If no client id is
+    /// configured we surface the inline note instead of calling anything.
+    private func handleGoogle() async {
+        guard !Config.googleClientID.isEmpty else {
+            auth.setError("Add your Google iOS client id in Config.swift to enable Google sign-in")
+            return
+        }
+        do {
+            let result = try await GoogleSignIn.signIn()
+            await auth.exchangeSocial(path: "/api/auth/google", body: [
+                "id_token": result.idToken,
+            ])
+        } catch GoogleSignIn.SignInError.cancelled {
+            auth.setError(nil)
+        } catch {
+            auth.setError(error.localizedDescription)
+        }
+    }
+}
+
+#Preview {
+    AuthView()
+        .environmentObject(AuthStore())
+        .environmentObject(LocalizationManager.shared)
+}

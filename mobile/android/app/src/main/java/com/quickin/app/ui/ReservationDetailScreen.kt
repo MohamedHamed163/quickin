@@ -1,0 +1,972 @@
+package com.quickin.app.ui
+
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.StickyNote2
+import androidx.compose.material.icons.filled.CreditCard
+import androidx.compose.material.icons.filled.DateRange
+import androidx.compose.material.icons.filled.HourglassEmpty
+import androidx.compose.material.icons.filled.IosShare
+import androidx.compose.material.icons.filled.LocationOn
+import androidx.compose.material.icons.filled.People
+import androidx.compose.material.icons.filled.ReportProblem
+import androidx.compose.material.icons.filled.StarBorder
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
+import com.quickin.app.BookingStatus
+import com.quickin.app.CancellationPolicy
+import com.quickin.app.CancellationQuote
+import com.quickin.app.R
+import com.quickin.app.PaymentFlowRules
+import com.quickin.app.Qr
+import com.quickin.app.Reservation
+import com.quickin.app.ReservationDetailUiState
+import com.quickin.app.ShareLinks
+import com.quickin.app.StayGuideItem
+import com.quickin.app.StayGuideKind
+import com.quickin.app.openLink
+import com.quickin.app.shareText
+import com.quickin.app.ui.theme.Burgundy
+import com.quickin.app.ui.theme.Cream
+import com.quickin.app.ui.theme.CreamPage
+import com.quickin.app.ui.theme.GoldDeep
+import com.quickin.app.ui.theme.Ink
+import com.quickin.app.ui.theme.Muted
+import com.quickin.app.ui.theme.Tan
+import androidx.compose.ui.graphics.asImageBitmap
+
+private val ErrorRed = Color(0xFFB3261E)
+
+/**
+ * Reservation DETAIL screen (`GET /api/local/bookings/:id`). Shows the stay details and an
+ * in-app reservation CARD bearing a QR code generated from the reservation_code (via ZXing).
+ * This is a plain in-app pass — NOT Apple Wallet / Google Wallet.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun ReservationDetailScreen(
+    state: ReservationDetailUiState,
+    onBack: () -> Unit,
+    onRetry: () -> Unit,
+    /** Non-null when this stay can be disputed; opens the report form. */
+    onReportIssue: (() -> Unit)? = null,
+    /** "Report an issue", or the status when one has already been raised. */
+    reportIssueLabel: String = "Report an issue",
+    /** When non-null and the reservation is still unpaid, a "Pay now" button opens the mock pay sheet. */
+    onPayNow: (() -> Unit)? = null,
+    canReview: Boolean = false,
+    reviewSubmitting: Boolean = false,
+    reviewError: String? = null,
+    onSubmitReview: (rating: Int, comment: String, photos: List<String>) -> Unit = { _, _, _ -> },
+    /**
+     * The signed-in account's id. Compared against the reservation's own `host_id` to decide
+     * whether the viewer hosts THIS stay — the gate on every host-only control below.
+     */
+    viewerId: String? = null,
+    /**
+     * The account-level `is_host` flag ("this account owns at least one listing"). NOT a gate on
+     * its own: it only stands in when the backend omits the reservation's `host_id`. Gating the
+     * host controls on it directly is what put the stay-guide builder on a guest's screen.
+     */
+    accountIsHost: Boolean = false,
+    /** True while a host-notes save is in flight. */
+    notesSaving: Boolean = false,
+    /** Error from the last host-notes save, or null. */
+    notesError: String? = null,
+    /** Host-only: persists the edited notes (`PATCH …/bookings/:id {host_notes}`). */
+    onSaveHostNotes: (notes: String) -> Unit = {},
+    /** Guest cancellation: opens the refund-quote confirm dialog (`GET …/bookings/:id/cancel`). */
+    onRequestCancel: () -> Unit = {},
+    /** Dismisses the cancel confirm dialog without cancelling. */
+    onDismissCancel: () -> Unit = {},
+    /** Confirms the cancellation (`POST …/bookings/:id/cancel`). */
+    onConfirmCancel: () -> Unit = {},
+    /** Host-only: appends a stay-guide item (`POST …/bookings/:id/stay-guide`). */
+    onAddGuideItem: (kind: StayGuideKind, title: String?, body: String?, url: String?) -> Unit = { _, _, _, _ -> },
+    /** Host-only: edits a stay-guide item in place (`PATCH …/stay-guide/:itemId`). */
+    onUpdateGuideItem: (itemId: String, title: String?, body: String?, url: String?) -> Unit = { _, _, _, _ -> },
+    /** Host-only: moves the item at `index` one slot up (`up = true`) or down. */
+    onMoveGuideItem: (index: Int, up: Boolean) -> Unit = { _, _ -> },
+    /** Host-only: removes a stay-guide item (`DELETE …/stay-guide/:itemId`). */
+    onDeleteGuideItem: (itemId: String) -> Unit = {}
+) {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    Scaffold(
+        containerColor = CreamPage,
+        topBar = {
+            TopAppBar(
+                title = { Text("Reservation", color = Ink, fontWeight = FontWeight.SemiBold) },
+                navigationIcon = {
+                    IconButton(onClick = onBack) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back", tint = Ink)
+                    }
+                },
+                actions = {
+                    // Share this reservation's public web link — only once it has loaded
+                    // (so we have a real id + title for the chooser).
+                    val reservation = state.reservation
+                    if (reservation != null) {
+                        IconButton(onClick = {
+                            shareText(
+                                context = context,
+                                text = ShareLinks.reservation(reservation.id),
+                                subject = context.getString(R.string.share_subject, reservation.title),
+                                chooserTitle = context.getString(R.string.share_chooser_title)
+                            )
+                        }) {
+                            Icon(Icons.Filled.IosShare, contentDescription = stringResource(R.string.cd_share), tint = Burgundy)
+                        }
+                    }
+                },
+                colors = TopAppBarDefaults.topAppBarColors(containerColor = CreamPage)
+            )
+        }
+    ) { padding ->
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(padding)
+                .background(CreamPage),
+            contentAlignment = Alignment.Center
+        ) {
+            when {
+                state.isLoading -> Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    CircularProgressIndicator(color = Burgundy)
+                    Text("Loading your reservation…", color = Muted, modifier = Modifier.padding(top = 12.dp))
+                }
+                state.error != null -> Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    modifier = Modifier.padding(32.dp)
+                ) {
+                    Text("Couldn't load reservation", fontWeight = FontWeight.Bold, color = Ink, fontSize = 18.sp)
+                    Text(state.error, color = Muted, textAlign = TextAlign.Center, modifier = Modifier.padding(top = 8.dp, bottom = 16.dp))
+                    Button(
+                        onClick = onRetry,
+                        colors = ButtonDefaults.buttonColors(containerColor = Burgundy, contentColor = Color.White)
+                    ) { Text("Retry") }
+                }
+                state.reservation != null -> ReservationCardContent(
+                    reservation = state.reservation,
+                    onReportIssue = onReportIssue,
+                    reportIssueLabel = reportIssueLabel,
+                    onPayNow = onPayNow,
+                    canReview = canReview,
+                    reviewSubmitting = reviewSubmitting,
+                    reviewError = reviewError,
+                    onSubmitReview = onSubmitReview,
+                    viewerId = viewerId,
+                    accountIsHost = accountIsHost,
+                    notesSaving = notesSaving,
+                    notesError = notesError,
+                    onSaveHostNotes = onSaveHostNotes,
+                    cancelQuote = state.cancelQuote,
+                    loadingQuote = state.loadingQuote,
+                    cancelling = state.cancelling,
+                    cancelError = state.cancelError,
+                    onRequestCancel = onRequestCancel,
+                    onDismissCancel = onDismissCancel,
+                    onConfirmCancel = onConfirmCancel,
+                    guide = state.guide,
+                    guideLoading = state.guideLoading,
+                    guideSaving = state.guideSaving,
+                    guideError = state.guideError,
+                    onAddGuideItem = onAddGuideItem,
+                    onUpdateGuideItem = onUpdateGuideItem,
+                    onMoveGuideItem = onMoveGuideItem,
+                    onDeleteGuideItem = onDeleteGuideItem
+                )
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ReservationCardContent(
+    reservation: Reservation,
+    onReportIssue: (() -> Unit)?,
+    reportIssueLabel: String,
+    onPayNow: (() -> Unit)? = null,
+    canReview: Boolean = false,
+    reviewSubmitting: Boolean = false,
+    reviewError: String? = null,
+    onSubmitReview: (rating: Int, comment: String, photos: List<String>) -> Unit = { _, _, _ -> },
+    viewerId: String? = null,
+    accountIsHost: Boolean = false,
+    notesSaving: Boolean = false,
+    notesError: String? = null,
+    onSaveHostNotes: (notes: String) -> Unit = {},
+    cancelQuote: CancellationQuote? = null,
+    loadingQuote: Boolean = false,
+    cancelling: Boolean = false,
+    cancelError: String? = null,
+    onRequestCancel: () -> Unit = {},
+    onDismissCancel: () -> Unit = {},
+    onConfirmCancel: () -> Unit = {},
+    guide: List<StayGuideItem> = emptyList(),
+    guideLoading: Boolean = false,
+    guideSaving: Boolean = false,
+    guideError: String? = null,
+    onAddGuideItem: (kind: StayGuideKind, title: String?, body: String?, url: String?) -> Unit = { _, _, _, _ -> },
+    onUpdateGuideItem: (itemId: String, title: String?, body: String?, url: String?) -> Unit = { _, _, _, _ -> },
+    onMoveGuideItem: (index: Int, up: Boolean) -> Unit = { _, _ -> },
+    onDeleteGuideItem: (itemId: String) -> Unit = {}
+) {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    // ── THE QR GATE ─────────────────────────────────────────────────────────────────────────
+    // `stayPassUrl` is non-null ONLY when the host has approved this reservation AND a real
+    // reservation code was issued for it (never blank, never the literal "null" — see
+    // Reservation.stayPassUrl / ShareLinks.stay). While the request is pending — and once it is
+    // rejected or cancelled — this is null and nothing pass-shaped renders: no QR, no code, no
+    // tappable stay link, no stay guide. The card shows the "appears once confirmed" state instead.
+    val stayUrl = reservation.stayPassUrl
+    val openStayPass: (() -> Unit)? = stayUrl?.let { url -> { openLink(context, url) } }
+
+    var showReviewDialog by remember { mutableStateOf(false) }
+
+    if (showReviewDialog) {
+        LeaveReviewDialog(
+            stayTitle = reservation.title,
+            submitting = reviewSubmitting,
+            error = reviewError,
+            onSubmit = { rating, comment, photos -> onSubmitReview(rating, comment, photos) },
+            onDismiss = { showReviewDialog = false }
+        )
+    }
+    LaunchedEffect(canReview) {
+        if (!canReview) showReviewDialog = false
+    }
+
+    // Guest cancellation: the quote is fetched first (no mutation), then confirmed here.
+    if (cancelQuote != null) {
+        CancelReservationDialog(
+            quote = cancelQuote,
+            cancelling = cancelling,
+            error = cancelError,
+            onConfirm = onConfirmCancel,
+            onDismiss = onDismissCancel
+        )
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            // The stay guide can make this taller than the viewport, so the whole pass scrolls.
+            .verticalScroll(rememberScrollState())
+            .padding(20.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(18.dp)
+    ) {
+        // The in-app reservation card: title, city, QR, code, and trip details. It is tappable —
+        // opening the public stay-pass page — ONLY when a pass exists; with no pass there is
+        // nothing to open, so the card is inert rather than a link to a broken URL.
+        if (openStayPass != null) {
+            Surface(
+                shape = RoundedCornerShape(28.dp),
+                color = Color.White,
+                shadowElevation = 6.dp,
+                onClick = openStayPass,
+                modifier = Modifier.fillMaxWidth()
+            ) { ReservationPassBody(reservation = reservation, stayUrl = stayUrl) }
+        } else {
+            Surface(
+                shape = RoundedCornerShape(28.dp),
+                color = Color.White,
+                shadowElevation = 6.dp,
+                modifier = Modifier.fillMaxWidth()
+            ) { ReservationPassBody(reservation = reservation, stayUrl = null) }
+        }
+
+        // Who is looking. The host-only controls below hang off the RESERVATION's host, never off
+        // the account-level "do you own any listing" flag — under the unified account a host is
+        // also an ordinary guest, and that flag handed them (and any other hosting guest) the
+        // stay-guide builder on their own trip the moment it was accepted.
+        val isHost = reservation.isViewerHost(viewerId, accountIsHost)
+
+        // "From your host" — guests see notes read-only; hosts get an inline editor below.
+        HostNotesCard(
+            notes = reservation.hostNotes,
+            isHost = isHost,
+            saving = notesSaving,
+            error = notesError,
+            onSave = onSaveHostNotes
+        )
+
+        // The host-authored stay guide. Guests see it read-only, gated on the pass (approved AND
+        // paid); the host gets the editor as soon as they approve, so they can write it while the
+        // guest pays. `awaitingApproval` is what keeps the host's "approve it and you can build
+        // one" note on a request that can still BE approved, rather than on a rejected one.
+        StayGuideSection(
+            items = guide,
+            isHost = isHost,
+            hasStayPass = reservation.hasStayPass,
+            canEdit = reservation.canEditStayGuide,
+            awaitingApproval = reservation.isAwaitingApproval,
+            loading = guideLoading,
+            saving = guideSaving,
+            error = guideError,
+            onAddItem = onAddGuideItem,
+            onUpdateItem = onUpdateGuideItem,
+            onMoveItem = onMoveGuideItem,
+            onDeleteItem = onDeleteGuideItem
+        )
+
+        // Payment is gated on host approval, and WHICH card shows is decided by PaymentFlowRules —
+        // the same rule the API and the website run — never by comparing `payment_status` here.
+        // The rejected branch is the one this block exists for: it used to fall through to the plain
+        // "Pay now" button, so a guest whose transfer an admin had turned down saw the screen they
+        // saw before paying at all, with no hint that anything had happened or what to fix.
+        when (reservation.paymentStage) {
+            PaymentFlowRules.Stage.Rejected -> {
+                PaymentRejectedCard(
+                    reason = reservation.paymentRejectReasonText,
+                    onTryAgain = onPayNow
+                )
+            }
+
+            PaymentFlowRules.Stage.AwaitingPayment -> {
+                // The primary CTA on this screen, so it pulses.
+                if (onPayNow != null) {
+                    GradientButton(
+                        onClick = onPayNow,
+                        radius = 18.dp,
+                        height = 52.dp,
+                        pulse = true,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Icon(Icons.Filled.CreditCard, null, tint = Color.White, modifier = Modifier.height(18.dp))
+                        Spacer(Modifier.width(8.dp))
+                        Text(stringResource(R.string.pay_now), color = Color.White, fontWeight = FontWeight.SemiBold, fontSize = 16.sp)
+                    }
+                }
+            }
+
+            PaymentFlowRules.Stage.UnderReview -> {
+                // Transfer screenshot submitted (or escalated to a dispute) — it is with us. No pay
+                // button, which avoids a duplicate transfer; the stage flips once it is reviewed.
+                PaymentHintCard(
+                    text = stringResource(R.string.instapay_under_review),
+                    tint = GoldDeep
+                )
+            }
+
+            PaymentFlowRules.Stage.NotPayable -> {
+                // Pending request — no pay button yet; say that the host must approve first.
+                if (reservation.isAwaitingApproval) {
+                    PaymentHintCard(
+                        text = stringResource(R.string.reservation_awaiting_approval),
+                        tint = Burgundy
+                    )
+                }
+            }
+
+            PaymentFlowRules.Stage.Paid -> Unit
+        }
+
+        // Raise an issue about this stay. Only offered on a confirmed or completed
+        // reservation — `onReportIssue` is null otherwise, and that eligibility is
+        // the server's answer (disputes-core), not a second copy of the rule here.
+        if (onReportIssue != null) {
+            androidx.compose.material3.OutlinedButton(
+                onClick = onReportIssue,
+                shape = RoundedCornerShape(18.dp),
+                border = androidx.compose.foundation.BorderStroke(1.dp, Burgundy),
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = Burgundy),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(52.dp)
+            ) {
+                Icon(Icons.Filled.ReportProblem, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(8.dp))
+                Text(reportIssueLabel, fontWeight = FontWeight.SemiBold, fontSize = 16.sp)
+            }
+        }
+
+        // For a confirmed stay past checkout, offer a review (server-gated via canReview).
+        if (canReview) {
+            androidx.compose.material3.OutlinedButton(
+                onClick = { showReviewDialog = true },
+                shape = RoundedCornerShape(18.dp),
+                border = androidx.compose.foundation.BorderStroke(1.dp, Burgundy),
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = Burgundy),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(52.dp)
+            ) {
+                Icon(Icons.Filled.StarBorder, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(8.dp))
+                Text(stringResource(R.string.review_leave), fontWeight = FontWeight.SemiBold, fontSize = 16.sp)
+            }
+        }
+
+        // Guests can cancel a pending/confirmed stay. Tapping fetches the refund quote first
+        // (GET …/cancel, no mutation); the dialog above confirms the destructive POST.
+        if (reservation.isCancellable) {
+            androidx.compose.material3.OutlinedButton(
+                onClick = onRequestCancel,
+                enabled = !loadingQuote && !cancelling,
+                shape = RoundedCornerShape(18.dp),
+                border = androidx.compose.foundation.BorderStroke(1.dp, ErrorRed),
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = ErrorRed),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(52.dp)
+            ) {
+                if (loadingQuote) {
+                    CircularProgressIndicator(color = ErrorRed, strokeWidth = 2.dp, modifier = Modifier.size(20.dp))
+                } else {
+                    Text(stringResource(R.string.cancel_reservation), fontWeight = FontWeight.SemiBold, fontSize = 16.sp)
+                }
+            }
+            // Quote fetch failed (e.g. no longer cancellable) — surface it inline under the button.
+            if (cancelError != null && cancelQuote == null) {
+                Text(
+                    cancelError,
+                    color = ErrorRed,
+                    fontSize = 13.sp,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+        }
+    }
+}
+
+/**
+ * The contents of the reservation pass card: status, place, then EITHER the QR + code (when
+ * [stayUrl] is non-null, i.e. the booking is approved and has a real reservation code) OR the
+ * "your QR appears once confirmed" placeholder — never a QR pointing at a fabricated URL.
+ */
+@Composable
+private fun ReservationPassBody(
+    reservation: Reservation,
+    stayUrl: String?
+) {
+    Column(
+        modifier = Modifier.padding(24.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        // A confirmed reservation earns a drawn-on green checkmark (qkDraw + qkPop).
+        if (BookingStatus.from(reservation.status) == BookingStatus.Confirmed) {
+            PopIn { DrawCheckmark(size = 64.dp) }
+            Spacer(Modifier.height(12.dp))
+        }
+        // Guest view: payment-aware badge — "Waiting for approval" (pending),
+        // "Approved" (confirmed + unpaid), or "Paid" (confirmed + paid).
+        StatusBadge(reservation.status, guestView = true, isPaid = reservation.isPaid)
+        Spacer(Modifier.height(14.dp))
+        Text(
+            reservation.title,
+            fontWeight = FontWeight.Bold,
+            fontSize = 20.sp,
+            color = Ink,
+            textAlign = TextAlign.Center
+        )
+        // City: the curated region when present, otherwise the listing location.
+        val city = reservation.cityText
+        if (city != null) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.padding(top = 4.dp)
+            ) {
+                Icon(Icons.Filled.LocationOn, null, tint = Muted, modifier = Modifier.height(16.dp))
+                Text(city, color = Muted, fontSize = 14.sp)
+            }
+        }
+
+        Spacer(Modifier.height(20.dp))
+
+        if (stayUrl != null) {
+            // QR encodes the public stay-pass URL (not the bare code), so a scan opens the page.
+            QrBlock(stayUrl)
+
+            Spacer(Modifier.height(10.dp))
+            // Caption: the QR (and the card) opens the stay pass.
+            Text(
+                stringResource(R.string.reservation_scan_or_tap),
+                color = Muted,
+                fontSize = 12.sp,
+                textAlign = TextAlign.Center
+            )
+
+            Spacer(Modifier.height(8.dp))
+            Text(stringResource(R.string.reservation_code_label), color = Muted, fontSize = 12.sp)
+            Text(
+                reservation.reservationCode.orEmpty(),
+                color = Burgundy,
+                fontWeight = FontWeight.Bold,
+                fontSize = 18.sp,
+                letterSpacing = 2.sp
+            )
+        } else {
+            // No pass yet (or ever): no QR, no code, no link — just why. Three different
+            // reasons, and only one of them is the guest's to act on.
+            NoPassBlock(
+                awaitingApproval = reservation.isAwaitingApproval,
+                awaitingPayment = reservation.isAwaitingPaymentForPass
+            )
+        }
+
+        Spacer(Modifier.height(20.dp))
+        HorizontalDivider(color = Tan)
+        Spacer(Modifier.height(16.dp))
+
+        DetailRow(Icons.Filled.DateRange, stringResource(R.string.reservation_dates), reservation.dateRangeText)
+        Spacer(Modifier.height(10.dp))
+        DetailRow(Icons.Filled.People, stringResource(R.string.reservation_guests_label), "${reservation.guests}")
+        Spacer(Modifier.height(10.dp))
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Text(stringResource(R.string.detail_total), color = Muted, fontSize = 14.sp)
+            Text(reservation.totalText, color = Burgundy, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+        }
+    }
+}
+
+/**
+ * Stands in for the QR while there is no stay pass. The two flags pick the copy: a pending request
+ * is told its code is coming once the host confirms ([awaitingApproval]); an approved-but-unpaid one
+ * is told it arrives once the payment clears ([awaitingPayment]) — the wait the guest can actually
+ * do something about; a rejected/cancelled one is simply told there is no pass. Deliberately the
+ * same 220dp footprint as [QrBlock] so the pass going live doesn't make the card jump.
+ */
+@Composable
+private fun NoPassBlock(awaitingApproval: Boolean, awaitingPayment: Boolean = false) {
+    Surface(
+        shape = RoundedCornerShape(20.dp),
+        color = Cream,
+        modifier = Modifier.size(220.dp)
+    ) {
+        Column(
+            modifier = Modifier.padding(20.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center
+        ) {
+            Icon(
+                Icons.Filled.HourglassEmpty,
+                contentDescription = null,
+                tint = if (awaitingApproval || awaitingPayment) Burgundy else Muted,
+                modifier = Modifier.size(34.dp)
+            )
+            Spacer(Modifier.height(12.dp))
+            Text(
+                stringResource(
+                    when {
+                        awaitingApproval -> R.string.reservation_qr_pending
+                        awaitingPayment -> R.string.reservation_qr_unpaid
+                        else -> R.string.reservation_qr_none
+                    }
+                ),
+                color = Ink,
+                fontSize = 13.sp,
+                textAlign = TextAlign.Center,
+                lineHeight = 18.sp
+            )
+        }
+    }
+}
+
+/**
+ * Why the last transfer was turned down, in the reviewer's words, with the way forward under it.
+ *
+ * THE fix for "[Android] payment rejection reason is not displayed to the guest": an admin rejects a
+ * transfer with a written reason, and the reservation used to go straight back to a bare "Pay now" —
+ * the same button shown to a guest who had never paid — so the only move available was to upload the
+ * identical unreadable screenshot again.
+ *
+ * [reason] is rendered verbatim: it is free text an admin typed for this guest, and paraphrasing it
+ * would defeat the point. When they left one off (older rows, and dispute outcomes carry none) a
+ * generic line stands in, because "your transfer wasn't accepted" is still far more than the guest
+ * used to be told.
+ */
+@Composable
+private fun PaymentRejectedCard(reason: String?, onTryAgain: (() -> Unit)?) {
+    Surface(
+        shape = RoundedCornerShape(18.dp),
+        color = Cream,
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(modifier = Modifier.padding(horizontal = 18.dp, vertical = 16.dp)) {
+            Row(verticalAlignment = Alignment.Top) {
+                Icon(
+                    Icons.Filled.ReportProblem,
+                    contentDescription = null,
+                    tint = ErrorRed,
+                    modifier = Modifier.size(20.dp)
+                )
+                Spacer(Modifier.width(10.dp))
+                Column {
+                    Text(
+                        stringResource(R.string.payment_rejected_title),
+                        color = Ink,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 15.sp
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        reason ?: stringResource(R.string.payment_rejected_no_reason),
+                        color = Ink,
+                        fontSize = 14.sp,
+                        lineHeight = 20.sp
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        stringResource(R.string.payment_rejected_subtitle),
+                        color = Muted,
+                        fontSize = 12.5.sp,
+                        lineHeight = 17.sp
+                    )
+                }
+            }
+            // A rejected screenshot is still payable — rejecting a blurry photo must not kill the
+            // reservation, so the retry sits inside the same card as the explanation.
+            if (onTryAgain != null) {
+                Spacer(Modifier.height(14.dp))
+                GradientButton(
+                    onClick = onTryAgain,
+                    radius = 18.dp,
+                    height = 52.dp,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Icon(Icons.Filled.CreditCard, null, tint = Color.White, modifier = Modifier.height(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        stringResource(R.string.pay_try_again),
+                        color = Color.White,
+                        fontWeight = FontWeight.SemiBold,
+                        fontSize = 16.sp
+                    )
+                }
+            }
+        }
+    }
+}
+
+/**
+ * A one-line payment status the guest can do nothing about — "under review" while a screenshot is
+ * with us, "awaiting host approval" before there is anything to pay. Deliberately has no button:
+ * offering one would invite a second transfer for the same stay.
+ */
+@Composable
+private fun PaymentHintCard(text: String, tint: Color) {
+    Surface(
+        shape = RoundedCornerShape(18.dp),
+        color = Cream,
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 18.dp, vertical = 16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.Center
+        ) {
+            Icon(Icons.Filled.HourglassEmpty, null, tint = tint, modifier = Modifier.height(18.dp))
+            Spacer(Modifier.width(8.dp))
+            Text(
+                text,
+                color = Ink,
+                fontWeight = FontWeight.SemiBold,
+                fontSize = 15.sp,
+                textAlign = TextAlign.Center
+            )
+        }
+    }
+}
+
+/**
+ * Confirm-cancellation dialog: shows the resolved policy, days until check-in and the refund
+ * breakdown from [quote] before the guest commits to the (destructive) cancel POST.
+ */
+@Composable
+private fun CancelReservationDialog(
+    quote: CancellationQuote,
+    cancelling: Boolean,
+    error: String?,
+    onConfirm: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    Dialog(
+        onDismissRequest = { if (!cancelling) onDismiss() },
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        Surface(
+            shape = RoundedCornerShape(28.dp),
+            color = Color.White,
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 24.dp)
+        ) {
+            Column(modifier = Modifier.padding(24.dp)) {
+                Text(
+                    stringResource(R.string.cancel_reservation),
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 18.sp,
+                    color = Ink
+                )
+                Spacer(Modifier.height(14.dp))
+
+                // Refund summary card: policy + countdown, then the refund line itself.
+                Surface(shape = RoundedCornerShape(16.dp), color = Cream, modifier = Modifier.fillMaxWidth()) {
+                    Column(modifier = Modifier.padding(16.dp)) {
+                        Text(
+                            stringResource(R.string.cancel_refund_quote),
+                            color = Ink,
+                            fontWeight = FontWeight.SemiBold,
+                            fontSize = 14.sp
+                        )
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            stringResource(
+                                R.string.cancel_refund_days,
+                                quote.daysUntilCheckIn,
+                                stringResource(CancellationPolicy.from(quote.policy).labelRes)
+                            ),
+                            color = Muted,
+                            fontSize = 13.sp
+                        )
+                        Spacer(Modifier.height(6.dp))
+                        if (quote.refundPercent > 0) {
+                            Text(
+                                stringResource(
+                                    R.string.cancel_refund_amount,
+                                    quote.refundAmountText,
+                                    quote.totalText,
+                                    quote.refundPercent
+                                ),
+                                color = Burgundy,
+                                fontWeight = FontWeight.SemiBold,
+                                fontSize = 14.sp
+                            )
+                        } else {
+                            Text(
+                                stringResource(R.string.cancel_no_refund),
+                                color = ErrorRed,
+                                fontWeight = FontWeight.SemiBold,
+                                fontSize = 14.sp
+                            )
+                        }
+                    }
+                }
+
+                if (error != null) {
+                    Spacer(Modifier.height(10.dp))
+                    Text(error, color = ErrorRed, fontSize = 13.sp)
+                }
+
+                Spacer(Modifier.height(18.dp))
+                GradientButton(
+                    onClick = onConfirm,
+                    enabled = !cancelling,
+                    radius = 16.dp,
+                    height = 48.dp,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    if (cancelling) {
+                        CircularProgressIndicator(color = Color.White, strokeWidth = 2.dp, modifier = Modifier.size(20.dp))
+                    } else {
+                        Text(
+                            stringResource(R.string.cancel_confirm),
+                            color = Color.White,
+                            fontWeight = FontWeight.SemiBold,
+                            fontSize = 15.sp
+                        )
+                    }
+                }
+                Spacer(Modifier.height(6.dp))
+                TextButton(
+                    onClick = onDismiss,
+                    enabled = !cancelling,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(stringResource(R.string.cancel_keep), color = Ink, fontWeight = FontWeight.SemiBold, fontSize = 15.sp)
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Renders the QR for [content] (the public stay-pass URL). The image content-description names the
+ * stay pass; if encoding fails it falls back to showing the raw [content] as text.
+ */
+@Composable
+private fun QrBlock(content: String) {
+    // Remember the bitmap per content so we don't re-encode on every recomposition.
+    val image = remember(content) { Qr.bitmap(content, sizePx = 600)?.asImageBitmap() }
+    Surface(
+        shape = RoundedCornerShape(20.dp),
+        color = Color.White,
+        shadowElevation = 0.dp,
+        modifier = Modifier.size(220.dp)
+    ) {
+        Box(contentAlignment = Alignment.Center, modifier = Modifier.padding(8.dp)) {
+            if (image != null) {
+                Image(
+                    bitmap = image,
+                    contentDescription = stringResource(R.string.cd_stay_pass_qr),
+                    contentScale = ContentScale.Fit,
+                    modifier = Modifier.fillMaxSize()
+                )
+            } else {
+                Text(
+                    content.ifBlank { stringResource(R.string.reservation_no_code) },
+                    color = Ink,
+                    fontWeight = FontWeight.Bold,
+                    textAlign = TextAlign.Center
+                )
+            }
+        }
+    }
+}
+
+/**
+ * The "From your host" panel.
+ *  • Guests see [notes] read-only (the card is hidden entirely when there are no notes).
+ *  • Hosts always see it, with a multiline editor prefilled with [notes] + a Save button that
+ *    calls [onSave]; [saving] swaps the button for a spinner and [error] shows inline.
+ */
+@Composable
+private fun HostNotesCard(
+    notes: String?,
+    isHost: Boolean,
+    saving: Boolean,
+    error: String?,
+    onSave: (String) -> Unit
+) {
+    // Guests with no notes get nothing; hosts always get the editor.
+    if (!isHost && notes.isNullOrBlank()) return
+
+    Surface(
+        shape = RoundedCornerShape(20.dp),
+        color = Cream,
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(modifier = Modifier.padding(18.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.AutoMirrored.Filled.StickyNote2, null, tint = Burgundy, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    stringResource(R.string.reservation_from_host),
+                    color = Ink,
+                    fontWeight = FontWeight.SemiBold,
+                    fontSize = 15.sp
+                )
+            }
+            Spacer(Modifier.height(12.dp))
+
+            if (isHost) {
+                // Editor prefilled with the current notes; re-seeded if the saved value changes.
+                var draft by remember(notes) { mutableStateOf(notes.orEmpty()) }
+                androidx.compose.material3.OutlinedTextField(
+                    value = draft,
+                    onValueChange = { draft = it },
+                    enabled = !saving,
+                    placeholder = { Text(stringResource(R.string.reservation_host_notes_hint), color = Muted) },
+                    minLines = 3,
+                    shape = RoundedCornerShape(16.dp),
+                    colors = androidx.compose.material3.OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = Burgundy,
+                        unfocusedBorderColor = Tan,
+                        cursorColor = Burgundy,
+                        focusedTextColor = Ink,
+                        unfocusedTextColor = Ink,
+                        focusedContainerColor = Color.White,
+                        unfocusedContainerColor = Color.White
+                    ),
+                    modifier = Modifier.fillMaxWidth()
+                )
+                if (error != null) {
+                    Spacer(Modifier.height(8.dp))
+                    Text(error, color = ErrorRed, fontSize = 13.sp)
+                }
+                Spacer(Modifier.height(12.dp))
+                GradientButton(
+                    onClick = { onSave(draft.trim()) },
+                    enabled = !saving,
+                    radius = 16.dp,
+                    height = 48.dp,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    if (saving) {
+                        CircularProgressIndicator(color = Color.White, strokeWidth = 2.dp, modifier = Modifier.size(20.dp))
+                    } else {
+                        Text(
+                            stringResource(R.string.reservation_save_notes),
+                            color = Color.White,
+                            fontWeight = FontWeight.SemiBold,
+                            fontSize = 15.sp
+                        )
+                    }
+                }
+            } else {
+                // Guest read-only view.
+                Text(notes.orEmpty(), color = Ink, fontSize = 14.sp)
+            }
+        }
+    }
+}
+
+@Composable
+private fun DetailRow(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    label: String,
+    value: String
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(icon, null, tint = Burgundy, modifier = Modifier.height(18.dp))
+        Spacer(Modifier.width(8.dp))
+        Text(label, color = Muted, fontSize = 14.sp)
+        Spacer(Modifier.weight(1f))
+        Text(value, color = Ink, fontSize = 14.sp, fontWeight = FontWeight.Medium)
+    }
+}

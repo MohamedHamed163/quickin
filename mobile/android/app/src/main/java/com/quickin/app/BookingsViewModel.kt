@@ -1,0 +1,598 @@
+package com.quickin.app
+
+import android.app.Application
+import android.content.Context
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+
+/** State for the "My Reservations" tab list. */
+data class ReservationsUiState(
+    val isLoading: Boolean = false,
+    val bookings: List<Booking> = emptyList(),
+    val error: String? = null,
+    val loaded: Boolean = false
+)
+
+/** State for a single reserve action on the listing detail screen. */
+data class ReserveUiState(
+    val isSubmitting: Boolean = false,
+    val error: String? = null,
+    /**
+     * Set on a 201; carries the just-created booking. Bookings now start as 'pending'
+     * (awaiting host confirmation), so the success card shows a "request sent" message.
+     */
+    val confirmed: Booking? = null,
+    /** True when the user tried to reserve while signed out. */
+    val needsSignIn: Boolean = false
+)
+
+/** State for the reservation DETAIL screen (`GET /api/local/bookings/:id`, with QR code). */
+data class ReservationDetailUiState(
+    val isLoading: Boolean = false,
+    val reservation: Reservation? = null,
+    val error: String? = null,
+    /** True while a host is saving notes (`PATCH …/bookings/:id {host_notes}`). */
+    val savingNotes: Boolean = false,
+    /** Error from the last host-notes save, or null. */
+    val notesError: String? = null,
+    /** True while fetching the refund quote (`GET …/bookings/:id/cancel`) before confirming. */
+    val loadingQuote: Boolean = false,
+    /** The refund quote to confirm against, or null when no cancel dialog is open. */
+    val cancelQuote: CancellationQuote? = null,
+    /** True while the cancel POST is in flight. */
+    val cancelling: Boolean = false,
+    /** Error from quoting / cancelling, or null. */
+    val cancelError: String? = null,
+    /**
+     * The host-authored stay guide for this booking (`GET …/bookings/:id/stay-guide`), in the
+     * host's order. Only fetched once the reservation is approved — an unconfirmed booking can't
+     * have one, so it stays empty.
+     */
+    val guide: List<StayGuideItem> = emptyList(),
+    /** True while the stay guide is loading. */
+    val guideLoading: Boolean = false,
+    /** True while a guide item is being created / edited / reordered / deleted. */
+    val guideSaving: Boolean = false,
+    /** Error from the last stay-guide read or write, or null. */
+    val guideError: String? = null
+)
+
+/**
+ * State for the MOCK payment sheet (`POST /api/local/bookings/:id/pay`). The sheet's
+ * *visibility* is owned by MainActivity (it tracks which booking is being paid + the amounts);
+ * this state only tracks the in-flight request, the resulting [PaymentReceipt] on success, and
+ * any error. There is no real gateway — the backend always succeeds for the booking owner.
+ */
+data class PaymentUiState(
+    val isPaying: Boolean = false,
+    /** Set on success; the receipt drives the "Booking confirmed & paid" confirmation. */
+    val receipt: PaymentReceipt? = null,
+    val error: String? = null,
+    /** True while a promo code is being previewed (`POST /api/local/promo/validate`). */
+    val validatingPromo: Boolean = false,
+    /**
+     * The last promo preview for the code the guest entered, or null when none has been applied /
+     * the field was cleared. A [PromoQuote.valid] quote nets its [PromoQuote.discount] off the
+     * shown total and its code is sent at pay; an invalid quote just shows its message.
+     */
+    val promo: PromoQuote? = null
+)
+
+/**
+ * State for the "Refer friends" surface on the Profile tab (`GET /api/local/referrals`).
+ * [summary] carries the user's code + stats once loaded.
+ */
+data class ReferralUiState(
+    val isLoading: Boolean = false,
+    val summary: ReferralSummary? = null,
+    val error: String? = null,
+    val loaded: Boolean = false
+)
+
+/**
+ * Owns reservation reads (the Reservations tab) and the reserve mutation (detail screen).
+ * Reads the bearer token directly from SharedPreferences ("qk_auth" / "token") for the
+ * Authorization header, so it works regardless of which screen triggers it.
+ */
+class BookingsViewModel(application: Application) : AndroidViewModel(application) {
+
+    private val prefs = application.getSharedPreferences(
+        AuthViewModel.PREFS_NAME, Context.MODE_PRIVATE
+    )
+
+    private val _reservations = MutableStateFlow(ReservationsUiState())
+    val reservations: StateFlow<ReservationsUiState> = _reservations.asStateFlow()
+
+    private val _reserve = MutableStateFlow(ReserveUiState())
+    val reserve: StateFlow<ReserveUiState> = _reserve.asStateFlow()
+
+    private val _detail = MutableStateFlow(ReservationDetailUiState())
+    val detail: StateFlow<ReservationDetailUiState> = _detail.asStateFlow()
+
+    private val _payment = MutableStateFlow(PaymentUiState())
+    val payment: StateFlow<PaymentUiState> = _payment.asStateFlow()
+
+    private val _referrals = MutableStateFlow(ReferralUiState())
+    val referrals: StateFlow<ReferralUiState> = _referrals.asStateFlow()
+
+    private fun token(): String? = prefs.getString(AuthViewModel.KEY_TOKEN, null)
+
+    /** Loads the signed-in user's reservations. No-op (with a friendly state) when signed out. */
+    fun loadReservations() {
+        val token = token()
+        if (token == null) {
+            _reservations.value = ReservationsUiState(loaded = true)
+            return
+        }
+        _reservations.value = _reservations.value.copy(isLoading = true, error = null)
+        viewModelScope.launch {
+            try {
+                val bookings = BookingService.fetchBookings(token)
+                _reservations.value = ReservationsUiState(
+                    isLoading = false,
+                    bookings = bookings,
+                    loaded = true,
+                    error = null
+                )
+            } catch (e: Exception) {
+                _reservations.value = ReservationsUiState(
+                    isLoading = false,
+                    loaded = true,
+                    error = humanError(e, "Could not load reservations.")
+                )
+            }
+        }
+    }
+
+    /** Clears reservation state on logout so a new user doesn't see stale data. */
+    fun clearReservations() {
+        _reservations.value = ReservationsUiState()
+    }
+
+    /**
+     * Reserves [listingId] for the given range. Surfaces:
+     *  • needsSignIn = true when no token (and on a 401 from the server),
+     *  • error = {message} on a 400 (e.g. "Those dates are not available"),
+     *  • confirmed = booking on 201.
+     */
+    fun createBooking(
+        listingId: String, checkIn: String, checkOut: String,
+        adults: Int, children: Int, infants: Int, pets: Int
+    ) {
+        if (_reserve.value.isSubmitting) return
+
+        val token = token()
+        if (token == null) {
+            _reserve.value = ReserveUiState(needsSignIn = true)
+            return
+        }
+
+        val guests = (adults + children).coerceAtLeast(1) // headcount; infants/pets don't count
+        _reserve.value = ReserveUiState(isSubmitting = true)
+        viewModelScope.launch {
+            try {
+                val booking = BookingService.createBooking(
+                    token, listingId, checkIn, checkOut, guests, adults, children, infants, pets
+                )
+                _reserve.value = ReserveUiState(confirmed = booking)
+                // Keep the Reservations tab fresh for the next visit.
+                loadReservations()
+            } catch (e: BookingService.HttpError) {
+                if (e.code == 401) {
+                    _reserve.value = ReserveUiState(needsSignIn = true)
+                } else {
+                    _reserve.value = ReserveUiState(error = humanError(e, "Could not reserve."))
+                }
+            } catch (e: Exception) {
+                _reserve.value = ReserveUiState(error = humanError(e, "Could not reserve."))
+            }
+        }
+    }
+
+    /** Resets the reserve panel (after dismissing a success/error, or when leaving the screen). */
+    fun resetReserve() {
+        _reserve.value = ReserveUiState()
+    }
+
+    /**
+     * Runs the MOCK payment for [bookingId]. On success the booking is paid + confirmed and the
+     * [PaymentReceipt] is published (the sheet shows a paid confirmation). The Reservations tab is
+     * refreshed so the stay reflects its new paid/confirmed state. There is no real charge.
+     */
+    fun pay(bookingId: String, method: String) {
+        if (_payment.value.isPaying) return
+        val token = token() ?: run {
+            _payment.value = _payment.value.copy(error = "Please sign in to pay.")
+            return
+        }
+        // Only send a code that previewed as valid; an invalid/blank preview is ignored.
+        val promoCode = _payment.value.promo?.takeIf { it.valid }?.code
+        _payment.value = _payment.value.copy(isPaying = true, error = null)
+        viewModelScope.launch {
+            try {
+                val receipt = BookingService.pay(token, bookingId, method, promoCode)
+                _payment.value = _payment.value.copy(isPaying = false, receipt = receipt, error = null)
+                // Reflect the now paid + confirmed booking across the Trips tab + any open detail.
+                loadReservations()
+                if (_detail.value.reservation?.id == bookingId) loadReservation(bookingId)
+            } catch (e: Exception) {
+                _payment.value = _payment.value.copy(
+                    isPaying = false,
+                    error = humanError(e, "Payment failed. Please try again.")
+                )
+            }
+        }
+    }
+
+    /**
+     * Previews [code] against [subtotal] (`POST /api/local/promo/validate`) so the pay sheet can
+     * show what it's worth before the guest pays. A valid quote is folded into [PaymentUiState.promo]
+     * (nets its discount off the shown total and is sent at pay); an invalid one surfaces its
+     * message. A blank code clears any applied promo.
+     */
+    fun validatePromo(code: String, subtotal: Int) {
+        val trimmed = code.trim()
+        if (trimmed.isBlank()) {
+            _payment.value = _payment.value.copy(promo = null, validatingPromo = false)
+            return
+        }
+        if (_payment.value.validatingPromo) return
+        val token = token() ?: run {
+            _payment.value = _payment.value.copy(error = "Please sign in to use a promo code.")
+            return
+        }
+        _payment.value = _payment.value.copy(validatingPromo = true, error = null)
+        viewModelScope.launch {
+            try {
+                val quote = BookingService.validatePromo(token, trimmed, subtotal)
+                _payment.value = _payment.value.copy(validatingPromo = false, promo = quote)
+            } catch (e: Exception) {
+                // Surface a not-valid quote so the sheet shows an inline message under the field.
+                _payment.value = _payment.value.copy(
+                    validatingPromo = false,
+                    promo = PromoQuote(
+                        valid = false,
+                        code = trimmed,
+                        message = humanError(e, "Couldn't validate that code.")
+                    )
+                )
+            }
+        }
+    }
+
+    /** Clears just the applied/previewed promo (e.g. when the guest edits or removes the code). */
+    fun clearPromo() {
+        if (_payment.value.promo != null || _payment.value.validatingPromo) {
+            _payment.value = _payment.value.copy(promo = null, validatingPromo = false)
+        }
+    }
+
+    /** Clears payment state (when the sheet closes, or before opening it for a new booking). */
+    fun resetPayment() {
+        _payment.value = PaymentUiState()
+    }
+
+    // ---- Referrals ------------------------------------------------------------
+
+    /** Loads the signed-in user's referral summary (`GET /api/local/referrals`). */
+    fun loadReferrals() {
+        val token = token() ?: run {
+            _referrals.value = ReferralUiState(loaded = true, error = "Please sign in.")
+            return
+        }
+        _referrals.value = _referrals.value.copy(isLoading = true, error = null)
+        viewModelScope.launch {
+            try {
+                val summary = BookingService.fetchReferrals(token)
+                _referrals.value = ReferralUiState(summary = summary, loaded = true)
+            } catch (e: Exception) {
+                _referrals.value = ReferralUiState(
+                    loaded = true,
+                    error = humanError(e, "Couldn't load your referrals.")
+                )
+            }
+        }
+    }
+
+    /** Clears referral state on logout so a new user doesn't see stale data. */
+    fun clearReferrals() {
+        _referrals.value = ReferralUiState()
+    }
+
+    /** Loads a single reservation (with reservation_code) for the detail / QR-card screen. */
+    fun loadReservation(bookingId: String) {
+        val token = token() ?: run {
+            _detail.value = ReservationDetailUiState(error = "Please sign in to view this reservation.")
+            return
+        }
+        _detail.value = ReservationDetailUiState(isLoading = true)
+        viewModelScope.launch {
+            try {
+                val reservation = BookingService.fetchReservation(token, bookingId)
+                _detail.value = ReservationDetailUiState(
+                    reservation = reservation,
+                    // A stay guide only exists on an approved booking; don't spend a call otherwise.
+                    guideLoading = reservation.isApproved
+                )
+                if (reservation.isApproved) loadStayGuide(bookingId)
+            } catch (e: Exception) {
+                _detail.value = ReservationDetailUiState(
+                    error = humanError(e, "Could not load this reservation.")
+                )
+            }
+        }
+    }
+
+    /** Clears the reservation-detail screen state (when navigating back). */
+    fun clearReservationDetail() {
+        _detail.value = ReservationDetailUiState()
+    }
+
+    /**
+     * Host-only: saves [notes] on [bookingId] (`PATCH …/bookings/:id {host_notes}`) and
+     * folds the updated notes into the open reservation so the editor + "From your host"
+     * card reflect the save immediately. Surfaces [notesError] on failure.
+     */
+    fun setHostNotes(bookingId: String, notes: String) {
+        if (_detail.value.savingNotes) return
+        val token = token() ?: run {
+            _detail.value = _detail.value.copy(notesError = "Please sign in to edit notes.")
+            return
+        }
+        _detail.value = _detail.value.copy(savingNotes = true, notesError = null)
+        viewModelScope.launch {
+            try {
+                val updated = BookingService.setHostNotes(token, bookingId, notes)
+                _detail.value = _detail.value.copy(
+                    savingNotes = false,
+                    notesError = null,
+                    // Reflect the saved notes on the open reservation (the PATCH returns a Booking).
+                    reservation = _detail.value.reservation?.copy(hostNotes = updated.hostNotes)
+                )
+            } catch (e: Exception) {
+                _detail.value = _detail.value.copy(
+                    savingNotes = false,
+                    notesError = humanError(e, "Could not save your notes.")
+                )
+            }
+        }
+    }
+
+    // ---- Stay guide (host-authored content on a confirmed booking) ------------
+
+    /**
+     * Loads the stay guide for [bookingId] (`GET …/bookings/:id/stay-guide`). Readable by the
+     * booking's guest and by the listing's host. A failure is surfaced as [guideError] and never
+     * blocks the rest of the reservation screen — the QR card must still render.
+     */
+    fun loadStayGuide(bookingId: String) {
+        val token = token() ?: return
+        _detail.value = _detail.value.copy(guideLoading = true, guideError = null)
+        viewModelScope.launch {
+            try {
+                val items = BookingService.fetchStayGuide(token, bookingId)
+                _detail.value = _detail.value.copy(guideLoading = false, guide = items, guideError = null)
+            } catch (e: Exception) {
+                _detail.value = _detail.value.copy(
+                    guideLoading = false,
+                    guideError = humanError(e, "Couldn't load the stay guide.")
+                )
+            }
+        }
+    }
+
+    /**
+     * Host-only: appends an item to [bookingId]'s stay guide. New items land at the end (one past
+     * the current highest order). The backend re-checks that the caller hosts this listing and that
+     * the booking is confirmed; a rejection surfaces as [guideError].
+     */
+    fun addStayGuideItem(
+        bookingId: String,
+        kind: StayGuideKind,
+        title: String?,
+        body: String?,
+        url: String?
+    ) {
+        if (_detail.value.guideSaving) return
+        val token = token() ?: run {
+            _detail.value = _detail.value.copy(guideError = "Please sign in to edit the stay guide.")
+            return
+        }
+        val nextOrder = (_detail.value.guide.maxOfOrNull { it.order } ?: -1) + 1
+        _detail.value = _detail.value.copy(guideSaving = true, guideError = null)
+        viewModelScope.launch {
+            try {
+                val item = BookingService.addStayGuideItem(
+                    token, bookingId, kind, title, body, url, nextOrder
+                )
+                _detail.value = _detail.value.copy(
+                    guideSaving = false,
+                    guideError = null,
+                    guide = (_detail.value.guide + item).sortedBy { it.order }
+                )
+            } catch (e: Exception) {
+                _detail.value = _detail.value.copy(
+                    guideSaving = false,
+                    guideError = humanError(e, "Couldn't add that to the stay guide.")
+                )
+            }
+        }
+    }
+
+    /** Host-only: edits one guide item's text / link in place. */
+    fun updateStayGuideItem(
+        bookingId: String,
+        itemId: String,
+        title: String?,
+        body: String?,
+        url: String?
+    ) {
+        if (_detail.value.guideSaving) return
+        val token = token() ?: run {
+            _detail.value = _detail.value.copy(guideError = "Please sign in to edit the stay guide.")
+            return
+        }
+        _detail.value = _detail.value.copy(guideSaving = true, guideError = null)
+        viewModelScope.launch {
+            try {
+                val updated = BookingService.updateStayGuideItem(
+                    token, bookingId, itemId, title = title, body = body, url = url
+                )
+                _detail.value = _detail.value.copy(
+                    guideSaving = false,
+                    guideError = null,
+                    guide = _detail.value.guide.map { if (it.id == updated.id) updated else it }
+                )
+            } catch (e: Exception) {
+                _detail.value = _detail.value.copy(
+                    guideSaving = false,
+                    guideError = humanError(e, "Couldn't save that change.")
+                )
+            }
+        }
+    }
+
+    /**
+     * Host-only: moves the item at [index] one slot [up] (or down). A no-op at the ends of the list.
+     *
+     * Rather than swapping the two `order` values — which does nothing when a guide arrived with
+     * duplicate orders (e.g. every row defaulted to 0) — this renumbers the reordered list 0..n-1
+     * and PATCHes only the rows whose number actually changed. On an already-sequential guide that
+     * is the same two requests; on a degenerate one it repairs the ordering.
+     */
+    fun moveStayGuideItem(bookingId: String, index: Int, up: Boolean) {
+        if (_detail.value.guideSaving) return
+        val items = _detail.value.guide
+        val other = if (up) index - 1 else index + 1
+        if (index !in items.indices || other !in items.indices) return
+        val token = token() ?: run {
+            _detail.value = _detail.value.copy(guideError = "Please sign in to edit the stay guide.")
+            return
+        }
+        // The original items in their new visual order; `moved[p]` still carries its OLD order, so
+        // anything whose old order isn't its new position needs a PATCH.
+        val moved = items.toMutableList().apply { add(other, removeAt(index)) }
+        val renumbered = moved.mapIndexed { position, item -> item.copy(order = position) }
+        val changed = moved.mapIndexedNotNull { position, item ->
+            if (item.order != position) item.copy(order = position) else null
+        }
+
+        _detail.value = _detail.value.copy(guideSaving = true, guideError = null)
+        viewModelScope.launch {
+            try {
+                changed.forEach { item ->
+                    BookingService.updateStayGuideItem(token, bookingId, item.id, order = item.order)
+                }
+                _detail.value = _detail.value.copy(
+                    guideSaving = false,
+                    guideError = null,
+                    guide = renumbered
+                )
+            } catch (e: Exception) {
+                _detail.value = _detail.value.copy(
+                    guideSaving = false,
+                    guideError = humanError(e, "Couldn't reorder the stay guide.")
+                )
+                // The PATCHes aren't atomic — re-read so the list matches the server.
+                loadStayGuide(bookingId)
+            }
+        }
+    }
+
+    /** Host-only: removes one guide item. */
+    fun deleteStayGuideItem(bookingId: String, itemId: String) {
+        if (_detail.value.guideSaving) return
+        val token = token() ?: run {
+            _detail.value = _detail.value.copy(guideError = "Please sign in to edit the stay guide.")
+            return
+        }
+        _detail.value = _detail.value.copy(guideSaving = true, guideError = null)
+        viewModelScope.launch {
+            try {
+                BookingService.deleteStayGuideItem(token, bookingId, itemId)
+                _detail.value = _detail.value.copy(
+                    guideSaving = false,
+                    guideError = null,
+                    guide = _detail.value.guide.filterNot { it.id == itemId }
+                )
+            } catch (e: Exception) {
+                _detail.value = _detail.value.copy(
+                    guideSaving = false,
+                    guideError = humanError(e, "Couldn't remove that item.")
+                )
+            }
+        }
+    }
+
+    // ---- Guest cancellation (quote + cancel) ----------------------------------
+
+    /**
+     * Fetches the refund quote for cancelling [bookingId] (`GET …/bookings/:id/cancel`, no
+     * mutation) and opens the confirm dialog by publishing [cancelQuote]. Surfaces [cancelError]
+     * on failure (e.g. the stay is no longer cancellable).
+     */
+    fun loadCancellationQuote(bookingId: String) {
+        if (_detail.value.loadingQuote || _detail.value.cancelling) return
+        val token = token() ?: run {
+            _detail.value = _detail.value.copy(cancelError = "Please sign in to cancel.")
+            return
+        }
+        _detail.value = _detail.value.copy(loadingQuote = true, cancelError = null, cancelQuote = null)
+        viewModelScope.launch {
+            try {
+                val quote = BookingService.cancellationQuote(token, bookingId)
+                _detail.value = _detail.value.copy(loadingQuote = false, cancelQuote = quote)
+            } catch (e: Exception) {
+                _detail.value = _detail.value.copy(
+                    loadingQuote = false,
+                    cancelError = humanError(e, "Couldn't load the refund details.")
+                )
+            }
+        }
+    }
+
+    /** Dismisses the cancel confirm dialog without cancelling (clears the quote + any error). */
+    fun dismissCancelQuote() {
+        _detail.value = _detail.value.copy(cancelQuote = null, cancelError = null, loadingQuote = false)
+    }
+
+    /**
+     * Cancels [bookingId] (`POST …/bookings/:id/cancel`). On success folds the cancelled status +
+     * refund percent into the open reservation, closes the dialog, and refreshes the Trips list so
+     * the cancelled stay reflects everywhere. Surfaces [cancelError] on failure.
+     */
+    fun cancelReservation(bookingId: String) {
+        if (_detail.value.cancelling) return
+        val token = token() ?: run {
+            _detail.value = _detail.value.copy(cancelError = "Please sign in to cancel.")
+            return
+        }
+        _detail.value = _detail.value.copy(cancelling = true, cancelError = null)
+        viewModelScope.launch {
+            try {
+                val cancelled = BookingService.cancelBooking(token, bookingId)
+                _detail.value = _detail.value.copy(
+                    cancelling = false,
+                    cancelQuote = null,
+                    cancelError = null,
+                    reservation = _detail.value.reservation?.copy(
+                        status = cancelled.status ?: "cancelled",
+                        cancelledAt = cancelled.cancelledAt,
+                        refundPercent = cancelled.refundPercent
+                    )
+                )
+                // Reflect the cancelled stay across the Trips tab.
+                loadReservations()
+            } catch (e: Exception) {
+                _detail.value = _detail.value.copy(
+                    cancelling = false,
+                    cancelError = humanError(e, "Couldn't cancel this reservation.")
+                )
+            }
+        }
+    }
+}

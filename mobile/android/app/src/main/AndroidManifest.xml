@@ -1,0 +1,119 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- "Use my current location" in the add-listing location picker (FusedLocationProvider). -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <!-- Show FCM push notifications. Runtime-requested on Android 13+ (see MainActivity);
+         auto-granted on older versions. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Fingerprint / face sign-in via AndroidX BiometricPrompt (BiometricAuthManager). -->
+    <uses-permission android:name="android.permission.USE_BIOMETRIC" />
+
+    <application
+        android:allowBackup="true"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:networkSecurityConfig="@xml/network_security_config"
+        android:theme="@style/Theme.QuickIn">
+
+        <!-- Google Maps API key. Sourced from the MAPS_API_KEY manifest placeholder
+             (see app/build.gradle.kts), which defaults to "". The Maps SDK only initializes
+             when a real key is supplied; otherwise the app falls back to the osmdroid
+             price-pill map (see ui/ListingsMap.kt, gated on Config.MAPS_API_KEY). -->
+        <meta-data
+            android:name="com.google.android.geo.API_KEY"
+            android:value="${MAPS_API_KEY}" />
+
+        <!-- FCM default notification channel — used by the system for notifications that arrive
+             while the app is backgrounded (display messages routed by the OS). The matching
+             channel "quickin_default" is created at runtime by QuickInMessagingService. -->
+        <meta-data
+            android:name="com.google.firebase.messaging.default_notification_channel_id"
+            android:value="quickin_default" />
+        <!-- Default small icon for FCM-display notifications. Reuses the launcher icon; FCM falls
+             back to it when a payload doesn't specify an icon. -->
+        <meta-data
+            android:name="com.google.firebase.messaging.default_notification_icon"
+            android:resource="@mipmap/ic_launcher" />
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:theme="@style/Theme.QuickIn">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <!-- Google OAuth redirect (Custom Tabs flow). Matches
+                 com.quickin.app:/oauth2redirect — see GoogleSignIn.REDIRECT_URI. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="com.quickin.app" android:host="" android:path="/oauth2redirect" />
+            </intent-filter>
+
+            <!-- App Links: open shared web links straight in the app when it's installed.
+                 autoVerify makes Android verify ownership of the host via the website's
+                 /.well-known/assetlinks.json (must list this app's package + the release
+                 signing cert SHA-256). Until verified, https links open in the browser (and
+                 land on the website) — never broken. Paths mirror ShareLinks / DeepLink:
+                 /explore/{id} · /reservation/{id}. /services is kept ONLY so old links to the
+                 removed Services feature still open the app: DeepLink.parse returns null for
+                 them and the app opens on home. -->
+            <intent-filter android:autoVerify="true">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="https" android:host="quickin-frontend.vercel.app" />
+                <data android:pathPrefix="/explore" />
+                <data android:pathPrefix="/services" />
+                <data android:pathPrefix="/reservation" />
+            </intent-filter>
+
+            <!-- Custom-scheme fallback (no verification needed), e.g. quickin://explore/{id}.
+                 Lets in-app / push / QR contexts open the app directly without relying on
+                 App Links verification. Parsed by DeepLink.parse alongside the https links. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="quickin" />
+            </intent-filter>
+
+            <!-- Launcher long-press quick actions / Assistant shortcuts (mirrors iOS Siri). -->
+            <meta-data
+                android:name="android.app.shortcuts"
+                android:resource="@xml/shortcuts" />
+        </activity>
+
+        <!-- Firebase Cloud Messaging service: receives new device tokens (onNewToken → register
+             with the backend) and incoming messages (onMessageReceived → post a notification).
+             The MESSAGING_EVENT intent-filter is how FCM delivers to the service. -->
+        <service
+            android:name=".QuickInMessagingService"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.google.firebase.MESSAGING_EVENT" />
+            </intent-filter>
+        </service>
+
+        <!-- AppCompat per-app locale auto-storage (API < 33). The autoStoreLocales meta-data makes
+             AppCompatDelegate.setApplicationLocales persist the in-app language choice to
+             SharedPreferences and re-apply it on the next launch. On API 33+ the platform stores it
+             instead. See LocaleManager. -->
+        <service
+            android:name="androidx.appcompat.app.AppLocalesMetadataHolderService"
+            android:enabled="false"
+            android:exported="false">
+            <meta-data
+                android:name="autoStoreLocales"
+                android:value="true" />
+        </service>
+    </application>
+</manifest>

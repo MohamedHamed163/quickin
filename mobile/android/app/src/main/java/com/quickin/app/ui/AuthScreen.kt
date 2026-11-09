@@ -1,0 +1,580 @@
+package com.quickin.app.ui
+
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Fingerprint
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.VisibilityOff
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.zIndex
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.quickin.app.AuthUiState
+import com.quickin.app.GoogleSignIn
+import com.quickin.app.EmailRules
+import com.quickin.app.NameRules
+import com.quickin.app.R
+import com.quickin.app.ui.theme.Burgundy
+import com.quickin.app.ui.theme.Cream
+import com.quickin.app.ui.theme.CreamPage
+import com.quickin.app.ui.theme.Ink
+import com.quickin.app.ui.theme.Muted
+import com.quickin.app.ui.theme.Tan
+
+private val ErrorRed = Color(0xFFB3261E)
+
+/**
+ * Authentication screen: email sign-in / sign-up plus a real, config-gated
+ * "Continue with Google" flow. Reachable from the Profile tab's sign-in CTA;
+ * [onBack] (when provided) shows a back arrow to return to browsing.
+ *
+ * @param onGoogleLaunch invoked with (nonce, state) to start the Google OAuth
+ *        Custom Tab. Only called when [GoogleSignIn.isConfigured] is true.
+ * @param onGoogleNotConfigured invoked when the user taps Google but no client id
+ *        is set, so the caller can surface an inline note (no fake success).
+ */
+@Composable
+fun AuthScreen(
+    state: AuthUiState,
+    onLogin: (email: String, password: String) -> Unit,
+    onSignup: (name: String, email: String, password: String) -> Unit,
+    onGoogleLaunch: (nonce: String, state: String) -> Unit,
+    onGoogleNotConfigured: () -> Unit,
+    onForgotPassword: () -> Unit,
+    /**
+     * Clears the shared auth error held by the ViewModel. Called when the user switches between
+     * sign-in and sign-up: a "wrong email or password" from a failed sign-in says nothing about
+     * the account the user is now trying to create, so it must not follow them across the toggle.
+     */
+    onClearError: () -> Unit = {},
+    /**
+     * True when the device has an enrolled biometric AND a previously-stored biometric session
+     * exists, so the "Sign in with fingerprint/face" button should be shown. [onBiometricLogin]
+     * launches the system prompt (handled by the caller, which owns the FragmentActivity host).
+     */
+    canBiometricLogin: Boolean = false,
+    onBiometricLogin: () -> Unit = {},
+    onBack: (() -> Unit)? = null
+) {
+    var isSignUp by remember { mutableStateOf(false) }
+    var name by remember { mutableStateOf("") }
+    var email by remember { mutableStateOf("") }
+    var password by remember { mutableStateOf("") }
+    // Sign-up only: the password typed a second time. A new account whose password holds a typo
+    // can't be signed into at all, so we ask twice. Cleared by the mode toggle below — switching
+    // modes hides the field, so coming back to sign-up starts from a clean, un-armed hint.
+    var confirmPassword by remember { mutableStateOf("") }
+
+    // An empty confirmation is not yet a wrong answer — the hint waits until something is typed.
+    val passwordsMismatch = isSignUp && confirmPassword.isNotEmpty() && confirmPassword != password
+
+    // Armed once the name field has been left, so a name is never called wrong
+    // while it is still being typed. Sign-up only — sign-in has no name field.
+    var nameTouched by remember { mutableStateOf(false) }
+    val nameError = nameFieldError(raw = name, touched = isSignUp && nameTouched)
+
+    // Armed once the email field has been left, so an address is never called
+    // wrong while it is still being typed. Sign-up is subject to the full rule
+    // (temp-mail included); sign-in is not, because it only ever touches an
+    // account that already exists. See `emailFieldError`.
+    var emailTouched by remember { mutableStateOf(false) }
+    var emailFocused by remember { mutableStateOf(false) }
+
+    // Everything the current mode needs except the address. Doubles as the fallback trigger for
+    // the email hint (see `authEmailHintArmed`) and, on sign-up, as the button's gate.
+    val otherFieldsReady = authOtherFieldsReady(
+        isSignUp = isSignUp,
+        name = name,
+        password = password,
+        confirmPassword = confirmPassword
+    )
+    val emailError = emailFieldError(
+        raw = email,
+        touched = authEmailHintArmed(
+            email = email,
+            touched = emailTouched,
+            focused = emailFocused,
+            otherFieldsReady = otherFieldsReady
+        ),
+        fullPolicy = isSignUp
+    )
+    val emailAcceptable = if (isSignUp) {
+        EmailRules.isAcceptableForSignup(email)
+    } else {
+        EmailRules.isValid(email)
+    }
+
+    val loading = state.isLoading
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(CreamPage)
+    ) {
+        if (onBack != null) {
+            IconButton(
+                onClick = onBack,
+                enabled = !loading,
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    // Draw + hit-test ABOVE the full-size scrollable form Column below; without this
+                    // the Column (declared later, .fillMaxSize().verticalScroll) sits on top and
+                    // swallows the tap, so the arrow was visible but not clickable.
+                    .zIndex(1f)
+                    .statusBarsPadding()  // sit BELOW the status bar so the arrow is reliably tappable
+                    .padding(8.dp)
+            ) {
+                Icon(
+                    Icons.AutoMirrored.Filled.ArrowBack,
+                    contentDescription = stringResource(R.string.cd_back_to_browsing),
+                    tint = Ink
+                )
+            }
+        }
+
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 28.dp, vertical = 48.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            // Brand logo (replaces the old "Quick In" text wordmark).
+            Image(
+                painter = painterResource(R.drawable.logo),
+                contentDescription = "Quick In",
+                contentScale = ContentScale.Fit,
+                modifier = Modifier.height(56.dp)
+            )
+            Text(
+                stringResource(R.string.brand_tagline),
+                color = Muted,
+                fontSize = 15.sp,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.padding(top = 14.dp, bottom = 32.dp)
+            )
+
+            // Sign In / Sign Up toggle
+            ModeToggle(
+                isSignUp = isSignUp,
+                enabled = !loading,
+                onSelect = {
+                    if (it != isSignUp) {
+                        isSignUp = it
+                        // Switching modes starts a fresh attempt at a DIFFERENT thing, so nothing
+                        // secret and nothing said about the old attempt may survive the toggle.
+                        // The form the user lands on is clean: both password fields are emptied,
+                        // the server's error is dropped, and EVERY inline hint is disarmed —
+                        // "wrong email or password" from a failed sign-in says nothing about the
+                        // account being created, and neither does a complaint about a field the
+                        // user has not touched since arriving. The typed email itself is kept:
+                        // whoever fails to sign in and decides to register is almost always
+                        // registering that same address. It re-arms on the next blur, or by
+                        // itself once it is the only thing left (see `authEmailHintArmed`), so a
+                        // sign-up-only refusal can still never leave the button dead in silence.
+                        password = ""
+                        confirmPassword = ""
+                        nameTouched = false
+                        emailTouched = false
+                        onClearError()
+                    }
+                }
+            )
+
+            Spacer(Modifier.height(24.dp))
+
+            if (isSignUp) {
+                AuthField(
+                    value = name,
+                    onValueChange = { name = it; if (nameTouched) nameTouched = false },
+                    label = stringResource(R.string.auth_full_name),
+                    enabled = !loading,
+                    isError = nameError != null,
+                    onFocusLost = { nameTouched = true }
+                )
+                if (nameError != null) {
+                    Text(
+                        nameError,
+                        color = ErrorRed,
+                        fontSize = 13.sp,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(top = 6.dp)
+                    )
+                }
+                Spacer(Modifier.height(14.dp))
+            }
+
+            AuthField(
+                value = email,
+                onValueChange = { email = it; if (emailTouched) emailTouched = false },
+                label = stringResource(R.string.auth_email),
+                enabled = !loading,
+                keyboardType = KeyboardType.Email,
+                isError = emailError != null,
+                onFocusLost = { emailTouched = true },
+                onFocusChange = { emailFocused = it }
+            )
+            if (emailError != null) {
+                Text(
+                    emailError,
+                    color = ErrorRed,
+                    fontSize = 13.sp,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 6.dp)
+                )
+            }
+            Spacer(Modifier.height(14.dp))
+
+            // Keyed on the mode so the toggle gives this field fresh internal state. The
+            // reveal ("eye") toggle lives inside AuthField and would otherwise stay on across
+            // the switch, showing the next mode's password in the clear. The confirm field
+            // below needs no key — it is removed with the `if (isSignUp)` branch and rebuilt.
+            key(isSignUp) {
+                AuthField(
+                    value = password,
+                    onValueChange = { password = it },
+                    label = stringResource(R.string.auth_password),
+                    enabled = !loading,
+                    keyboardType = KeyboardType.Password,
+                    isPassword = true
+                )
+            }
+
+            // Animated strength meter + requirements checklist — sign-up only (a new password).
+            if (isSignUp) {
+                Spacer(Modifier.height(12.dp))
+                PasswordStrength(password = password)
+
+                Spacer(Modifier.height(14.dp))
+                AuthField(
+                    value = confirmPassword,
+                    onValueChange = { confirmPassword = it },
+                    label = stringResource(R.string.auth_confirm_password),
+                    enabled = !loading,
+                    keyboardType = KeyboardType.Password,
+                    isPassword = true,
+                    isError = passwordsMismatch
+                )
+                if (passwordsMismatch) {
+                    Text(
+                        stringResource(R.string.password_mismatch),
+                        color = ErrorRed,
+                        fontSize = 13.sp,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(top = 6.dp)
+                    )
+                }
+            }
+
+            // "Forgot password?" — sign-in mode only. Opens the standalone reset route.
+            if (!isSignUp) {
+                Row(modifier = Modifier.fillMaxWidth()) {
+                    Spacer(Modifier.weight(1f))
+                    TextButton(
+                        onClick = onForgotPassword,
+                        enabled = !loading,
+                        colors = ButtonDefaults.textButtonColors(contentColor = Burgundy)
+                    ) {
+                        Text(stringResource(R.string.auth_forgot_password), fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+                    }
+                }
+            }
+
+            // Inline error / note
+            if (state.error != null) {
+                Text(
+                    state.error,
+                    color = ErrorRed,
+                    fontSize = 13.sp,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 12.dp)
+                )
+            }
+
+            Spacer(Modifier.height(22.dp))
+
+            // Primary action — burgundy gradient with a pulsing ring (qkPulse).
+            // On sign-up the button stays disabled until the new password meets the minimum bar and
+            // has been typed identically twice.
+            // An address the server would refuse can never sign in or sign up, so
+            // the button waits on it too — this screen used to submit anything
+            // with an `@` in it and let the user find out from a 400.
+            // `12345` is non-empty and is not a name — the name is held to the
+            // same rule the server applies, not just to being filled in.
+            val canSubmit = !loading && emailAcceptable && (!isSignUp || otherFieldsReady)
+            GradientButton(
+                onClick = {
+                    if (isSignUp) onSignup(NameRules.normalized(name), email, password)
+                    else onLogin(email, password)
+                },
+                enabled = canSubmit,
+                pulse = canSubmit,
+                radius = 18.dp,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                if (loading) {
+                    CircularProgressIndicator(
+                        color = Color.White,
+                        strokeWidth = 2.dp,
+                        modifier = Modifier.size(22.dp)
+                    )
+                } else {
+                    Text(
+                        stringResource(if (isSignUp) R.string.auth_create_account else R.string.auth_sign_in),
+                        color = Color.White,
+                        fontWeight = FontWeight.SemiBold,
+                        fontSize = 16.sp
+                    )
+                }
+            }
+
+            Spacer(Modifier.height(24.dp))
+
+            DividerWithLabel(stringResource(R.string.auth_or))
+
+            Spacer(Modifier.height(24.dp))
+
+            // Continue with Google — real, config-gated.
+            OutlinedButton(
+                onClick = {
+                    if (GoogleSignIn.isConfigured) {
+                        onGoogleLaunch(GoogleSignIn.newNonce(), GoogleSignIn.newNonce())
+                    } else {
+                        onGoogleNotConfigured()
+                    }
+                },
+                enabled = !loading,
+                shape = RoundedCornerShape(18.dp),
+                border = BorderStroke(1.dp, Tan),
+                colors = ButtonDefaults.outlinedButtonColors(
+                    containerColor = Color.White,
+                    contentColor = Ink
+                ),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(54.dp)
+            ) {
+                Image(
+                    painter = painterResource(R.drawable.ic_google_g),
+                    contentDescription = null,
+                    modifier = Modifier.size(20.dp)
+                )
+                Spacer(Modifier.width(10.dp))
+                Text(stringResource(R.string.auth_continue_google), fontWeight = FontWeight.SemiBold, fontSize = 15.sp)
+            }
+
+            // Biometric sign-in — only in sign-in mode, and only when the device can run a prompt
+            // AND a session was previously stored (the caller computes [canBiometricLogin]). Tapping
+            // launches the system fingerprint/face prompt; on success the caller restores the session.
+            if (!isSignUp && canBiometricLogin) {
+                Spacer(Modifier.height(14.dp))
+                OutlinedButton(
+                    onClick = onBiometricLogin,
+                    enabled = !loading,
+                    shape = RoundedCornerShape(18.dp),
+                    border = BorderStroke(1.dp, Tan),
+                    colors = ButtonDefaults.outlinedButtonColors(
+                        containerColor = Color.White,
+                        contentColor = Burgundy
+                    ),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(54.dp)
+                ) {
+                    Icon(
+                        Icons.Filled.Fingerprint,
+                        contentDescription = null,
+                        tint = Burgundy,
+                        modifier = Modifier.size(22.dp)
+                    )
+                    Spacer(Modifier.width(10.dp))
+                    Text(stringResource(R.string.auth_biometric_login), fontWeight = FontWeight.SemiBold, fontSize = 15.sp)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ModeToggle(
+    isSignUp: Boolean,
+    enabled: Boolean,
+    onSelect: (Boolean) -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(Tan, RoundedCornerShape(16.dp))
+            .padding(4.dp)
+    ) {
+        ToggleTab(stringResource(R.string.auth_sign_in_toggle), selected = !isSignUp, enabled = enabled, modifier = Modifier.weight(1f)) {
+            onSelect(false)
+        }
+        ToggleTab(stringResource(R.string.auth_sign_up_toggle), selected = isSignUp, enabled = enabled, modifier = Modifier.weight(1f)) {
+            onSelect(true)
+        }
+    }
+}
+
+@Composable
+private fun ToggleTab(
+    label: String,
+    selected: Boolean,
+    enabled: Boolean,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit
+) {
+    val container = if (selected) Color.White else Color.Transparent
+    val content = if (selected) Burgundy else Muted
+    Button(
+        onClick = onClick,
+        enabled = enabled,
+        shape = RoundedCornerShape(12.dp),
+        elevation = null,
+        colors = ButtonDefaults.buttonColors(
+            containerColor = container,
+            contentColor = content,
+            disabledContainerColor = container,
+            disabledContentColor = content
+        ),
+        modifier = modifier.height(44.dp)
+    ) {
+        Text(label, fontWeight = FontWeight.SemiBold, fontSize = 15.sp)
+    }
+}
+
+@Composable
+private fun AuthField(
+    value: String,
+    onValueChange: (String) -> Unit,
+    label: String,
+    enabled: Boolean,
+    keyboardType: KeyboardType = KeyboardType.Text,
+    isPassword: Boolean = false,
+    isError: Boolean = false,
+    /** Called when focus leaves the field — used to arm an inline hint. */
+    onFocusLost: (() -> Unit)? = null,
+    /** Called with the field's focus state on every change — used to keep a hint quiet while typing. */
+    onFocusChange: ((Boolean) -> Unit)? = null
+) {
+    // Independent reveal state per field; only meaningful when isPassword.
+    var passwordVisible by remember { mutableStateOf(false) }
+    var wasFocused by remember { mutableStateOf(false) }
+    OutlinedTextField(
+        value = value,
+        onValueChange = onValueChange,
+        label = { Text(label) },
+        enabled = enabled,
+        isError = isError,
+        singleLine = true,
+        keyboardOptions = KeyboardOptions(keyboardType = keyboardType),
+        visualTransformation = if (isPassword && !passwordVisible) {
+            PasswordVisualTransformation()
+        } else {
+            VisualTransformation.None
+        },
+        trailingIcon = if (isPassword) {
+            {
+                IconButton(onClick = { passwordVisible = !passwordVisible }) {
+                    Icon(
+                        imageVector = if (passwordVisible) Icons.Filled.VisibilityOff else Icons.Filled.Visibility,
+                        contentDescription = stringResource(if (passwordVisible) R.string.auth_hide_password else R.string.auth_show_password),
+                        tint = Muted
+                    )
+                }
+            }
+        } else {
+            null
+        },
+        shape = RoundedCornerShape(18.dp),
+        colors = OutlinedTextFieldDefaults.colors(
+            focusedBorderColor = Burgundy,
+            unfocusedBorderColor = Tan,
+            focusedLabelColor = Burgundy,
+            cursorColor = Burgundy,
+            focusedContainerColor = Color.White,
+            unfocusedContainerColor = Color.White
+        ),
+        modifier = Modifier
+            .fillMaxWidth()
+            .onFocusChanged { focus ->
+                // Fire only on the way OUT. An inline hint that appears the
+                // moment you tap the field is telling you your address is wrong
+                // before you have typed it.
+                onFocusChange?.invoke(focus.isFocused)
+                if (focus.isFocused) {
+                    wasFocused = true
+                } else if (wasFocused) {
+                    wasFocused = false
+                    onFocusLost?.invoke()
+                }
+            }
+    )
+}
+
+@Composable
+private fun DividerWithLabel(label: String) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        HorizontalDivider(modifier = Modifier.weight(1f), color = Tan)
+        Text(
+            label,
+            color = Muted,
+            fontSize = 13.sp,
+            modifier = Modifier.padding(horizontal = 14.dp)
+        )
+        HorizontalDivider(modifier = Modifier.weight(1f), color = Tan)
+    }
+}
